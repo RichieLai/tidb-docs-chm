@@ -84,5 +84,5 @@ python3 tools/verify_chm.py dist/tidb-docs-cn-images/tidb-docs-cn-images.chm
 ```
 
 期望结果：顶层章节 14 个 / 节点 949 个 / 最大层级 6 级 / 833 个链接 0 缺失 /
-无索引文件 / 829 个 HTML 全部带 UTF-8 BOM。阅读器侧请**先退出或用 ⌘W 关闭
-旧文档**，再打开新产物。
+无索引文件 / 829 个 HTML 全部带 UTF-8 BOM / `dist/` 下只留 CHM（中间产物已清理）。
+阅读器侧请**先退出或用 ⌘W 关闭旧文档**，再打开新产物。

@@ -7,7 +7,9 @@
 #   ./build.sh release-8.5    # 生成指定版本（分支名）
 #   ./build.sh --images       # 生成含图片版（默认 compact 压缩档）
 #   ./build.sh --images --image-profile original   # 含图片但保留原图
+#   ./build.sh --keep-html    # 额外保留 HTML 版与 hhc/hhp 工程文件
 #
+# 产物默认只保留 CHM；HTML/工程文件是打包用中间产物，构建成功后自动清理。
 # 幂等可重复执行：venv、源码仓库、产物均自动准备/更新。
 set -euo pipefail
 
@@ -21,11 +23,21 @@ PY="$VENV/bin/python"
 REF="master"
 WITH_IMAGES=0
 HAS_PROFILE=0
+PRUNE="chm"
 IMAGE_ARGS=()
 for arg in "$@"; do
     case "$arg" in
         --images|--keep-images)
             WITH_IMAGES=1
+            ;;
+        --keep-html|--keep-all)
+            PRUNE="none"
+            ;;
+        --keep-hhp)
+            PRUNE="hhp"
+            ;;
+        --only-chm|--prune-chm)
+            PRUNE="chm"
             ;;
         --image-profile=*)
             WITH_IMAGES=1
@@ -37,7 +49,7 @@ for arg in "$@"; do
             IMAGE_ARGS+=("$arg")
             ;;
         --*)
-            echo "未知参数：${arg}（支持 --images 与 --image-* 参数）" >&2
+            echo "未知参数：${arg}（支持 --images、--image-*、--keep-html、--keep-hhp）" >&2
             exit 2
             ;;
         *)
@@ -105,6 +117,7 @@ BUILD_ARGS=(
     --out "$OUT"
     --title "$TITLE"
     --chm "$CHM"
+    --prune "$PRUNE"
     --all --lang zh
 )
 if [ "$WITH_IMAGES" = 1 ]; then
@@ -133,5 +146,12 @@ log "产物自检（目录卫生 / 编码）"
 
 log "完成"
 echo "  离线文档 : $CHM_PATH"
-echo "  效果预览 : $OUT/preview.html"
-echo "  官方工程 : $OUT/docs.hhp（Windows 上 hhc.exe docs.hhp 可重编标准 CHM）"
+if [ "$PRUNE" = "none" ]; then
+    echo "  效果预览 : $OUT/preview.html"
+    echo "  官方工程 : $OUT/docs.hhp（Windows 上 hhc.exe docs.hhp 可重编标准 CHM）"
+elif [ "$PRUNE" = "hhp" ]; then
+    echo "  官方工程 : $OUT/docs.hhp（Windows 上 hhc.exe docs.hhp 可重编标准 CHM）"
+else
+    echo "  仅保留   : CHM（HTML/工程文件是打包中间产物，已清理）"
+    echo "  如需 HTML 版：./build.sh --keep-html"
+fi

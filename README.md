@@ -24,14 +24,18 @@ tidb-docs-chm/
 ├── repos/                   [gitignore] 文档源仓库，脚本自动克隆/更新
 │   └── docs-cn/             pingcap/docs-cn（中文）
 ├── dist/                    [gitignore] 构建产物
-│   ├── tidb-docs-cn/        无图版（*.chm + *.html + toc.hhc + index.hhk + docs.hhp）
-│   └── tidb-docs-cn-images/ 含图片版（--images）
+│   ├── tidb-docs-cn/        无图版：**只有 tidb-docs-cn.chm**
+│   └── tidb-docs-cn-images/ 含图片版：只有 tidb-docs-cn-images.chm
 ├── .venv/                   [gitignore] 脚本自动创建的 Python 虚拟环境
 └── .gitignore
 ```
 
 仓库里只提交**工具与文档**；文档源仓库（400+ MB）、构建产物、虚拟环境都不入库，
 克隆后跑一次 `./build.sh` 即可全部重建。
+
+打包用的 HTML 页面、`toc.hhc`、`docs.hhp` 等都只是**中间产物**（内容已经全部
+嵌进 CHM），构建成功后会自动清理，`dist/` 里只留 CHM；需要浏览器可读的 HTML 版
+或 Windows 重编工程时用 `--keep-html` / `--keep-hhp`。
 
 ## 2. 环境要求
 
@@ -58,6 +62,10 @@ cd ~/Documents/tidb-docs-chm
 
 # 含图片、保留原图（约 124 MB）
 ./build.sh --images --image-profile original
+
+# 需要浏览器可读的 HTML 版 / Windows 重编工程（不清理中间产物）
+./build.sh --keep-html
+./build.sh --keep-hhp
 ```
 
 脚本幂等，可反复执行。它会依次完成：
@@ -68,10 +76,18 @@ cd ~/Documents/tidb-docs-chm
 3. 解析官方目录 `TOC.md`，转换全部文档，打包 CHM 到 `dist/`（约 30 秒）
 4. 用 7-Zip 做完整性校验（如果安装了的话）
 5. 跑 `tools/verify_chm.py` 自检（目录来源、索引泄漏、树统计、正文编码）
-6. 打印产物路径
+6. 清理打包中间产物（HTML/工程文件），`dist/` 里只留 CHM；打印产物路径
 
 产物在 `dist/tidb-docs-cn/`（指定版本时为 `dist/tidb-docs-<分支名>/`；含图片版为
 `dist/tidb-docs-cn-images/`、`dist/tidb-docs-<分支名>-images/`）。
+
+清理策略（`--prune`，`build.sh` 默认 `chm`）：
+
+| 取值 | 保留 | 适用 |
+| --- | --- | --- |
+| `chm`（默认） | 仅 `*.chm` | 只要离线文档 |
+| `hhp` | `*.chm` + `docs.hhp` / `toc.hhc` / `index.hhk` | 需要在 Windows 上用 `hhc.exe` 重编 |
+| `none` | 全部（HTML 版、预览页、工程文件） | 想在浏览器里直接看 HTML |
 
 ## 4. 手动构建
 
@@ -159,15 +175,17 @@ CHM 自身不做压缩，图片原样入库时体积很大，因此提供三档�
 
 ## 6. 产物清单
 
+默认（`--prune chm`）`dist/` 里**只有 CHM**；下表其余文件是打包中间产物／可选产物：
+
 | 文件 | 用途 |
 | --- | --- |
 | `*.chm` | 离线文档本体，Windows 双击用 hh.exe 打开，左侧目录树可折叠 |
 | `tidb-docs-cn.chm` / `tidb-docs-cn-images.chm` | 无图版（约 9.7 MB，默认）/ 含图片版（compact 档约 38.5 MB） |
-| `docs.hhp` | HTML Help 工程文件。Windows 上执行 `hhc.exe docs.hhp` 可用微软官方编译器重新编译（产物为 LZX 压缩的标准 CHM，体积约 1/3） |
-| `toc.hhc` | 官方格式的目录源文件，**打包进 CHM**（侧栏目录的唯一来源） |
-| `index.hhk` | 官方格式的索引源文件，**只留在磁盘**给 `hhc.exe` 用，不打进 CHM（原因见下） |
-| `index.html` + `*.html` + `style.css` | 浏览器可直接打开的 HTML 版本 |
-| `preview.html` | 模拟 CHM 阅读器窗口的预览页（左目录树 + 右内容），不进 CHM，仅本地预览用 |
+| `docs.hhp`（`--keep-hhp` 保留） | HTML Help 工程文件。Windows 上执行 `hhc.exe docs.hhp` 可用微软官方编译器重新编译（产物为 LZX 压缩的标准 CHM，体积约 1/3） |
+| `toc.hhc`（`--keep-hhp` 保留） | 官方格式的目录源文件，**已打包进 CHM**（侧栏目录的唯一来源），磁盘上这份是给 `hhc.exe` 用的 |
+| `index.hhk`（`--keep-hhp` 保留） | 官方格式的索引源文件，**不打进 CHM**（原因见下），只在磁盘上给 `hhc.exe` 用 |
+| `index.html` + `*.html` + `style.css`（`--keep-html` 保留） | 打包 CHM 用的正文页面，同时可当作浏览器可读的 HTML 版 |
+| `preview.html`（`--keep-html` 保留） | 模拟 CHM 阅读器窗口的预览页（左目录树 + 右内容），不进 CHM，仅本地预览用 |
 
 ## 7. 中文编码约定
 
@@ -222,7 +240,7 @@ CHM 是微软专有格式，官方编译器只能在 Windows 上运行。本工�
 python3 tools/verify_chm.py dist/tidb-docs-cn/tidb-docs-cn.chm   # 目录卫生：无索引泄漏 + 树统计
 7zz t dist/tidb-docs-cn/tidb-docs-cn.chm          # 完整性测试 -> Everything is Ok
 7zz l dist/tidb-docs-cn/tidb-docs-cn.chm          # 列出全部条目
-7zz x dist/tidb-docs-cn/tidb-docs-cn.chm -o/tmp/c # 提取，可与 dist/tidb-docs-cn/ 下源 HTML 逐字节比对
+7zz x dist/tidb-docs-cn/tidb-docs-cn.chm -o/tmp/c # 提取（加 --keep-html 构建后可与源 HTML 逐字节比对）
 ```
 
 `verify_chm.py` 输出示例（目录源 / 索引 / 树统计 / 链接缺失 / 正文编码）：
@@ -284,7 +302,16 @@ macOS 上无法直接验证 hh.exe 行为。用 `docs.hhp` 在 Windows 上
 `--image-jpeg-quality`（JPEG 质量）；`--image-colors 0 --image-max-width 1600`
 则是"只降采样、不动颜色"。CHM 本身不做 LZX 压缩，所以体积主要由图片决定。
 
-**含图片版的 HTML 版（`dist/tidb-docs-cn-images/*.html`）在浏览器里看不到图？**
+**为什么 `dist/` 下只有 CHM，HTML 是中间产物吗？**
+
+是。`build_chm.py` 的工作方式是"先把 Markdown 转成 HTML，再把这些 HTML
+连同图片、目录源一起塞进 CHM"，所以 HTML 页面（833 个）、图片、`toc.hhc`、
+`docs.hhp` 都只是**打包输入**；CHM 是完全自包含的，删掉它们不影响阅读。
+构建成功后 `build.sh` 会自动清理这些中间产物（`--prune chm`，默认），
+`dist/` 里只留 CHM。想保留浏览器可读的 HTML 版用 `--keep-html`，
+想保留 Windows 重编工程用 `--keep-hhp`。
+
+**用 `--keep-html` 后，HTML 版在浏览器里看不到图？**
 CHM 内图片用的是 `/media/...` 绝对路径，`file://` 直接打开 HTML 取不到；
 要看 HTML 版就起个本地服务：`python3 -m http.server 8000 -d dist/tidb-docs-cn-images`
 然后访问 `http://localhost:8000/`，或者直接看 CHM。

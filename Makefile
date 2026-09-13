@@ -11,7 +11,7 @@ help:
 	@echo "make build          无图版 CHM  -> $(CHM)"
 	@echo "make images         含图片版 CHM（compact 档）-> $(CHM_IMAGES)"
 	@echo "make verify         自检两个 CHM（目录卫生 / 编码）"
-	@echo "make preview        浏览器打开无图版预览页"
+	@echo "make preview        保留 HTML 版并在浏览器打开预览页"
 	@echo "make clean          删除 dist/（仅构建产物）"
 
 build:
@@ -25,6 +25,7 @@ verify:
 	@[ -f "$(CHM_IMAGES)" ] && $(PY) tools/verify_chm.py $(CHM_IMAGES) || true
 
 preview:
+	./build.sh --keep-html
 	open $(DIST)/tidb-docs-cn/preview.html
 
 clean:

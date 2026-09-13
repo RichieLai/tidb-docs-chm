@@ -742,6 +742,10 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="最多收录多少篇文档，0 表示不限")
     ap.add_argument("--images", "--keep-images", dest="images", action="store_true",
                     help="包含文档引用的图片资源（默认不包含，体积最小）")
+    ap.add_argument("--prune", default="none", choices=["none", "hhp", "chm"],
+                    help="打包完成后清理中间产物：none=保留 HTML 版与工程文件（默认）；"
+                         "hhp=只留 *.chm + docs.hhp/toc.hhc/index.hhk（Windows 重编用）；"
+                         "chm=只留 *.chm")
     ap.add_argument("--image-profile", default="original",
                     choices=sorted(IMAGE_PROFILES),
                     help="图片压缩档位：original=原图（默认）；"
@@ -961,13 +965,22 @@ def main() -> int:
         print(f"      目录卫生检查 OK：侧栏目录来源仅 {toc_source}，"
               f"无 *.hhk 索引与额外汇总条目")
 
+    if args.prune != "none" and hygiene_ok:
+        keep = {args.chm}
+        if args.prune == "hhp":
+            keep |= {"docs.hhp", "toc.hhc", "index.hhk"}
+        removed, freed = prune_out_dir(out, [*file_list, "docs.hhp"], keep)
+        print(f"      清理中间产物 {removed} 个（-{freed / 1048576:.1f} MB），"
+              f"只保留：{'、'.join(sorted(keep))}")
+
     total_html = sum(len(v) for v in pages.values())
     chm_size = os.path.getsize(chm_path)
     print()
     print("构建完成")
-    print(f"  HTML 总计 : {total_html / 1024:.1f} KB（{len(pages)} 个文件）")
+    print(f"  HTML 总计 : {total_html / 1024:.1f} KB（{len(pages)} 个文件，已打进 CHM）")
     print(f"  CHM 大小  : {chm_size / 1024:.1f} KB  -> {chm_path}")
-    print(f"  HHP 工程  : {os.path.join(out, 'docs.hhp')}（Windows: hhc.exe docs.hhp）")
+    if args.prune != "chm":
+        print(f"  HHP 工程  : {os.path.join(out, 'docs.hhp')}（Windows: hhc.exe docs.hhp）")
     return 0 if hygiene_ok else 1
 
 
@@ -986,6 +999,32 @@ def prune_entries(entries: list[TocEntry], allowed: set[str]) -> list[TocEntry]:
         elif children:
             out.append(TocEntry(e.title, "", children))
     return out
+
+
+def prune_out_dir(out: str, written: list[str], keep: set[str]) -> tuple[int, int]:
+    """删除本次构建写出的中间产物，只保留 keep 中的文件；返回 (删除数, 释放字节)。
+
+    只动本次真正写出的文件（HTML 页面、CSS、图片、toc.hhc/index.hhk/docs.hhp），
+    顺带清掉因此变空的目录，不会误删目录里其它内容。
+    """
+    removed = 0
+    freed = 0
+    for name in written:
+        if name in keep:
+            continue
+        path = os.path.join(out, name)
+        if os.path.isfile(path):
+            freed += os.path.getsize(path)
+            os.remove(path)
+            removed += 1
+    for root, _dirs, _files in os.walk(out, topdown=False):
+        if os.path.abspath(root) == os.path.abspath(out):
+            continue
+        try:
+            os.rmdir(root)  # 只删空目录
+        except OSError:
+            pass
+    return removed, freed
 
 
 if __name__ == "__main__":
