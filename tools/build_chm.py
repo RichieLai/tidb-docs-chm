@@ -194,17 +194,24 @@ def strip_videos(text: str, stats: dict) -> str:
 
 
 FENCE_LINE_RE = re.compile(
-    r"^(?P<quote>(?:>[ \t]?)*)(?P<indent>[ \t]*)(?P<mark>`{3,}|~{3,})[ \t]*"
-    r"(?P<lang>[A-Za-z0-9_+#.-]*).*$"
+    r"^(?P<lead>[ \t]*)(?P<quote>(?:>[ \t]?)*)(?P<indent>[ \t]*)"
+    r"(?P<mark>`{3,}|~{3,})[ \t]*(?P<lang>[A-Za-z0-9_+#.-]*).*$"
 )
 
+# 代码块占位符。Python-Markdown 只把「行首缩进 < 4 空格」的原始 HTML 当块处理，
+# 而列表项里的代码块必然缩进 ≥ 4 空格（引用块里的还要带 `> ` 前缀），直接把
+# `<pre><code>` 写进正文会被当成段落文字再解析一遍：`# 注释` 变成标题、代码被
+# 拆成好几段。所以这里只放占位符，等 Markdown 转换完再整体换回真正的 HTML。
+CODE_TOKEN_FMT = "%%CHM-CODE-{}%%"
+CODE_TOKEN_RE = re.compile(r"%%CHM-CODE-(\d+)%%")
 
-def convert_fences(text: str, stats: dict) -> str:
-    """把围栏代码块转成 `<pre><code>`。
+
+def convert_fences(text: str, stats: dict, code_blocks: list[str]) -> str:
+    """把围栏代码块换成占位符，渲染好的 `<pre><code>` 追加进 code_blocks。
 
     Python-Markdown 的 fenced_code 不认列表项内缩进 4 空格的围栏（```` ```shell ````
-    会被当成行内 code，``` 直接出现在正文里）。自己转成 HTML 更稳，且能顺带
-    保护代码示例不被后面的短代码/变量替换规则误改。
+    会被当成行内 code，``` 直接出现在正文里），所以自己扫描围栏；换成占位符后
+    代码内容也不会被后面的短代码/变量/链接替换规则误改。
     """
     lines = text.split("\n")
     out: list[str] = []
@@ -216,10 +223,11 @@ def convert_fences(text: str, stats: dict) -> str:
             out.append(lines[i])
             i += 1
             continue
-        quote, indent, mark, lang = (m.group("quote"), m.group("indent"),
-                                     m.group("mark"), m.group("lang"))
+        lead, quote, indent, mark, lang = (m.group("lead"), m.group("quote"),
+                                           m.group("indent"), m.group("mark"),
+                                           m.group("lang"))
         closing = re.compile(
-            "^" + re.escape(quote) + r"[ \t]*" + re.escape(mark[0])
+            "^" + re.escape(lead) + re.escape(quote) + r"[ \t]*" + re.escape(mark[0])
             + "{" + str(len(mark)) + r",}[ \t]*$"
         )
         body: list[str] = []
@@ -233,14 +241,14 @@ def convert_fences(text: str, stats: dict) -> str:
             continue
         dedented = []
         for ln in body:
-            if quote and ln.startswith(quote):
-                ln = ln[len(quote):]
-            if indent and ln.startswith(indent):
-                ln = ln[len(indent):]
+            for prefix in (lead, quote, indent):
+                if prefix and ln.startswith(prefix):
+                    ln = ln[len(prefix):]
             dedented.append(ln)
         code = html_lib.escape("\n".join(dedented))
         cls = f' class="language-{lang}"' if lang else ""
-        out.append(f"{quote}{indent}<pre><code{cls}>{code}</code></pre>")
+        code_blocks.append(f"<pre><code{cls}>{code}</code></pre>")
+        out.append(f"{lead}{quote}{indent}{CODE_TOKEN_FMT.format(len(code_blocks) - 1)}")
         count += 1
         i = j + 1
     stats["code_blocks"] = stats.get("code_blocks", 0) + count
@@ -365,9 +373,10 @@ def clean_markdown(text: str, keep_images: bool, stats: dict,
                    variables: dict[str, str] | None = None,
                    link_index: dict[str, str] | None = None,
                    included: set[str] | None = None,
-                   web_prefix: str = "") -> tuple[dict, str]:
+                   web_prefix: str = "") -> tuple[dict, str, list[str]]:
     meta, body = split_frontmatter(text)
-    body = convert_fences(body, stats)
+    code_blocks: list[str] = []
+    body = convert_fences(body, stats, code_blocks)
     if variables:
         # 标题/摘要也会展示在页面上，同样要做变量替换
         meta = {k: apply_template_vars(v, variables, stats) if isinstance(v, str) else v
@@ -376,7 +385,7 @@ def clean_markdown(text: str, keep_images: bool, stats: dict,
     body = normalize_blocks(body)
     body = strip_videos(body, stats)
     body = rewrite_links(body, keep_images, stats, link_index, included, web_prefix)
-    return meta, body
+    return meta, body, code_blocks
 
 
 # --------------------------------------------------------------------------
@@ -517,8 +526,40 @@ def render_callouts(html_text: str) -> str:
     return html_text
 
 
-def md_to_html(md_text: str) -> str:
-    return markdown.markdown(md_text, extensions=MD_EXTENSIONS, output_format="html")
+P_BLOCK_RE = re.compile(r"<p>(.*?)</p>", re.S)
+
+
+def restore_code_blocks(html_text: str, code_blocks: list[str]) -> str:
+    """把占位符换回 `<pre><code>` 代码块。
+
+    占位符独立成段时（列表项、引用块里都是这种情况），去掉 Markdown 加上的
+    `<p>` 外壳；万一和正文落在同一段里，就按位置拆成「正文段落 + 代码块」。
+    """
+    if not code_blocks or not CODE_TOKEN_RE.search(html_text):
+        return html_text
+
+    def fix_paragraph(m: re.Match) -> str:
+        inner = m.group(1)
+        if not CODE_TOKEN_RE.search(inner):
+            return m.group(0)
+        parts = CODE_TOKEN_RE.split(inner)
+        out: list[str] = []
+        for idx, seg in enumerate(parts):
+            if idx % 2:  # 奇数位是占位符里的编号
+                out.append(code_blocks[int(seg)])
+            elif seg.strip():
+                out.append(f"<p>{seg.strip()}</p>")
+        return "".join(out)
+
+    html_text = P_BLOCK_RE.sub(fix_paragraph, html_text)
+    return CODE_TOKEN_RE.sub(lambda m: code_blocks[int(m.group(1))], html_text)
+
+
+def md_to_html(md_text: str, code_blocks: list[str] | None = None) -> str:
+    html_text = markdown.markdown(md_text, extensions=MD_EXTENSIONS, output_format="html")
+    if code_blocks:
+        html_text = restore_code_blocks(html_text, code_blocks)
+    return html_text
 
 
 BLOCK_IN_P_RE = re.compile(r"<p>\s*(<pre>.*?</pre>)\s*</p>", re.S | re.I)
@@ -1024,9 +1065,9 @@ def main() -> int:
             continue
         if idx % 200 == 0:
             print(f"      {idx}/{len(doc_paths)}")
-        meta, body = clean_markdown(raw, args.images, stats, variables, link_index,
-                                    included, web_prefix)
-        html_body = unwrap_block_in_p(render_callouts(md_to_html(body)))
+        meta, body, code_blocks = clean_markdown(raw, args.images, stats, variables,
+                                                 link_index, included, web_prefix)
+        html_body = unwrap_block_in_p(render_callouts(md_to_html(body, code_blocks)))
         title = meta.get("title") or os.path.basename(path)[:-3].replace("-", " ").title()
         summary = meta.get("summary", "")
         page = wrap_page(title, html_body, subtitle=summary, lang=args.lang,

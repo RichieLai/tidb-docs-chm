@@ -25,6 +25,7 @@ tidb-docs-chm/
 ├── tools/                   构建与校验工具
 │   ├── build_chm.py         流水线：TOC 解析 → Markdown 清洗 → HTML → CHM
 │   ├── chmwriter.py         CHM 打包器（ITSF 容器）+ 只读解析器
+│   ├── test_render.py       渲染回归测试（代码块嵌套 + 全量文档扫描）
 │   └── verify_chm.py        产物自检：目录来源、索引泄漏、树统计、编码
 ├── docs/                    项目文档
 │   ├── verification.md      验收记录（问题现象 / 根因 / 证据）
@@ -307,6 +308,19 @@ CHM 是微软专有格式，官方编译器只能在 Windows 上运行。本工�
 7-Zip 源码 `CPP/7zip/Archive/Chm/ChmIn.cpp`。
 
 ## 9. 验证方法
+
+渲染回归测试（改 `build_chm.py` 后先跑这个，再重新构建）：
+
+```bash
+python3 tools/test_render.py            # 用例 + 全量扫描 1239 篇文档
+python3 tools/test_render.py --fast     # 只跑用例（不扫全量）
+make test                               # 等价于第一条
+```
+
+用例覆盖代码块嵌在列表项、嵌套列表、引用块、`<div label>` 容器里的情形；全量扫描会把
+`repos/docs-cn` 每篇 Markdown 走一遍渲染，检查有没有代码块被二次解析成标题/段落。
+
+产物侧核对：
 
 ```bash
 python3 tools/verify_chm.py dist/tidb-docs-cn/tidb-docs-cn.chm   # 目录卫生：无索引泄漏 + 树统计
