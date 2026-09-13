@@ -59,7 +59,9 @@ tidb-docs-chm/
 ## 3. 一键生成（推荐）
 
 ```bash
-cd ~/Documents/tidb-docs-chm
+# 首次：克隆本仓库（文档源仓库与产物都由脚本自动准备）
+git clone https://github.com/wencycool/tidb-docs-chm.git
+cd tidb-docs-chm
 
 # 最新版（master 分支）：默认一次出两版
 #   dist/tidb-docs-cn/tidb-docs-cn.chm               无图版       约 2.5 MB
