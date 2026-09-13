@@ -96,7 +96,44 @@ macOS 阅读器侧栏仍干净（用"有索引 / 无索引"两个变体对照复
 **证据**：[`screenshots/07-lzx-compressed.jpg`](screenshots/07-lzx-compressed.jpg)
 （2.5 MB 的 LZX 压缩产物在阅读器中的效果）。
 
-## 5. 通用复核清单
+## 5. 正文格式与链接（站点私有写法）
+
+**现象**：部分页面（如"部署本地测试集群"）整段排版塌掉——`>` 引用、```` ``` ````
+围栏代码块、有序列表都当普通文字铺在一起；正文里还会出现 `{{{ .company }}}`
+这类模板标记；不少超链接指向官网，离线点不开。
+
+**根因**：
+
+1. `<div label="macOS">`、`<details>` 等 HTML 容器内的内容没有加 `markdown="1"`，
+   容器里的 Markdown 根本没被渲染；
+2. 即使渲染，Python-Markdown 的 `fenced_code` 也不认"列表项内缩进 4 空格"的围栏，
+   会退化成行内 `code`；
+3. `{{{ … }}}` 是官网站点的 Hugo 变量，构建时未做替换；
+4. 官网 URL（`https://docs.pingcap.com/zh/tidb/<ver>/…`）未映射回本地页面。
+
+**修复**（`tools/build_chm.py`）：
+
+| 项 | 做法 | 实测 |
+| --- | --- | --- |
+| Hugo 变量 | 读仓库 `variables.json` 替换；未知键去掉标记 | 替换 74 处，未知 0 |
+| HTML 容器 | `<div label=…>` / `<details>` 加 `markdown="1"` | 容器内列表/引用正常成块 |
+| 代码围栏 | 统一转 `<pre><code>`（保留缩进与语言类名） | 7115 个代码块 |
+| 官网链接 → 本地 | 目标在本 CHM 内才改内链 | 改内链 56 处 |
+| 未收录页面链接 | 改指官网（GitHub/Cloud/K8s 等保持外链） | 1003 处改官网，1022 处保留外链 |
+| 裸媒体链接 | `[x](/media/y.png)`：打包图片时保留，否则退化为纯文本 | 488 处（无图版） |
+
+**证据**：
+[`screenshots/08-page-format-fixed.jpg`](screenshots/08-page-format-fixed.jpg)（页面整体排版）、
+[`screenshots/09-code-block-fixed.jpg`](screenshots/09-code-block-fixed.jpg)（代码块/列表/引用局部）。
+
+**回归校验**（解包后扫描 HTML 里的 `href`/`src`）：
+
+```
+无图版：本地链接 9109，外链 3635，断链 0，缺失图片引用 0
+含图版：本地链接 9111，外链 3635，断链 0，缺失图片引用 0
+```
+
+## 6. 通用复核清单
 
 ```bash
 ./build.sh && ./build.sh --images

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import html as html_lib
+import json
 import os
 import re
 import shutil
@@ -141,10 +142,24 @@ VIDEO_LEAD_RE = re.compile(
     re.M | re.I,
 )
 SHORTCODE_RE = re.compile(r"\{\{<.*?>\}\}", re.S)
+# Hugo 变量：{{{ .company }}} / {{{.tidb-operator-version}}}，取值见仓库 variables.json
+# （只处理三花括号形式；`{{fn .Table}}`、`{{ColumnName}}` 等出现在代码/模板示例里，必须原样保留）
+TEMPLATE_VAR_RE = re.compile(r"\{\{\{\s*\.([A-Za-z0-9_-]+)\s*\}\}\}")
 SIMPLETAB_RE = re.compile(r"</?SimpleTab[^>]*>", re.I)
-DIV_LABEL_RE = re.compile(r'<div\s+label="([^"]*)"\s*>', re.I)
+DIV_LABEL_RE = re.compile(r'<div\s+[^>]*?\blabel="([^"]*)"[^>]*>', re.I)
+DETAILS_RE = re.compile(r"<details(\s+markdown=\"1\")?>", re.I)
 IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
-MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((/[^)\s]+\.md)(#[^)\s]*)?\)")
+# 链接文字里允许出现 [ ]（如 [`BATCH [ON COLUMN] LIMIT INTEGER DELETE`](/x.md)）
+MD_LINK_RE = re.compile(r"\[((?:[^\[\]]|\[[^\]]*\])*)\]\((/[^)\s]+\.md)(#[^)\s]*)?\)")
+# 指向 /media/... 的普通链接（少数文档用它代替图片语法）
+MEDIA_LINK_RE = re.compile(r"\[((?:[^\[\]]|\[[^\]]*\])*)\]\((/media/[^)\s]+)\)")
+# 官网 TiDB 自管理文档链接：命中仓库内文档就改成本地页面，其它站点保持外链
+PINGCAP_DOC_RE = re.compile(
+    r"https?://docs\.pingcap\.com/(?:zh/)?tidb/"
+    r"(?:stable|dev|v\d+\.\d+(?:\.\d+)?)/([^)#?\s]+)"
+    r"(#[^)\s\"'<>]*)?",
+    re.I,
+)
 
 
 def split_frontmatter(text: str) -> tuple[dict, str]:
@@ -178,13 +193,136 @@ def strip_videos(text: str, stats: dict) -> str:
     return text
 
 
-def rewrite_links(text: str, keep_images: bool, stats: dict) -> str:
-    """站内 .md 链接 -> .html；图片按策略保留或省略。"""
+FENCE_LINE_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<mark>`{3,}|~{3,})[ \t]*(?P<lang>[A-Za-z0-9_+#.-]*).*$"
+)
+
+
+def convert_fences(text: str, stats: dict) -> str:
+    """把围栏代码块转成 `<pre><code>`。
+
+    Python-Markdown 的 fenced_code 不认列表项内缩进 4 空格的围栏（```` ```shell ````
+    会被当成行内 code，``` 直接出现在正文里）。自己转成 HTML 更稳，且能顺带
+    保护代码示例不被后面的短代码/变量替换规则误改。
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    count = 0
+    i = 0
+    while i < len(lines):
+        m = FENCE_LINE_RE.match(lines[i])
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+        indent, mark, lang = m.group("indent"), m.group("mark"), m.group("lang")
+        closing = re.compile(
+            r"^[ \t]*" + re.escape(mark[0]) + "{" + str(len(mark)) + r",}[ \t]*$"
+        )
+        body: list[str] = []
+        j = i + 1
+        while j < len(lines) and not closing.match(lines[j]):
+            body.append(lines[j])
+            j += 1
+        if j >= len(lines):  # 没有闭合围栏：保持原样
+            out.append(lines[i])
+            i += 1
+            continue
+        dedented = [
+            (ln[len(indent):] if indent and ln.startswith(indent) else ln)
+            for ln in body
+        ]
+        code = html_lib.escape("\n".join(dedented))
+        cls = f' class="language-{lang}"' if lang else ""
+        out.append(f"{indent}<pre><code{cls}>{code}</code></pre>")
+        count += 1
+        i = j + 1
+    stats["code_blocks"] = stats.get("code_blocks", 0) + count
+    return "\n".join(out)
+
+
+def apply_template_vars(text: str, variables: dict[str, str], stats: dict) -> str:
+    """替换 Hugo 变量 {{{ .key }}}；仓库里没有的键直接去掉标记，避免正文露出 {{{ ... }}}。"""
+    def sub(m: re.Match) -> str:
+        key = m.group(1)
+        if key in variables:
+            stats["vars"] += 1
+            return variables[key]
+        stats["vars_unknown"][key] = stats["vars_unknown"].get(key, 0) + 1
+        return ""
+
+    return TEMPLATE_VAR_RE.sub(sub, text)
+
+
+def build_link_index(doc_paths: list[str], raw_map: dict[str, str]) -> dict[str, str]:
+    """建立 slug -> 仓库内 md 路径的索引，用于把官网链接改成本地页面。
+
+    slug 取文件名（官网 URL 用的是同一套短名），并补充 front matter 里的 aliases。
+    同名冲突时优先取层级更浅的那个（更接近官网的稳定链接）。
+    """
+    index: dict[str, str] = {}
+    for path in sorted(doc_paths, key=lambda p: (p.count("/"), p)):
+        index.setdefault(os.path.basename(path)[:-3], path)
+    for path, text in raw_map.items():
+        m = FRONTMATTER_RE.match(text)
+        if not m:
+            continue
+        for alias in re.findall(r"['\"](/[^'\"]+)['\"]", m.group(1)):
+            slug = alias.rstrip("/").split("/")[-1]
+            if slug and slug not in index:
+                index[slug] = path
+    return index
+
+
+def rewrite_links(text: str, keep_images: bool, stats: dict,
+                  link_index: dict[str, str] | None = None,
+                  included: set[str] | None = None,
+                  web_prefix: str = "") -> str:
+    """链接改写：
+
+    - 指向**本 CHM 内**页面的 .md 链接 -> 本地 .html
+    - 指向**未收录**页面的 .md 链接 -> 官网地址（离线时可自行判断去官网看）
+    - 官网自管理文档链接若目标在本 CHM 内 -> 本地页面；否则保持外链
+    - 图片按策略保留或省略
+    """
     def link_sub(m: re.Match) -> str:
         label, target, anchor = m.group(1), m.group(2), m.group(3) or ""
-        return f"[{label}]({target[:-3]}.html{anchor})"
+        path = target.lstrip("/")
+        if included is None or path in included:
+            return f"[{label}]({target[:-3]}.html{anchor})"
+        # 该页面没有打进 CHM：改指官网，避免留下点不开的站内链接
+        slug = os.path.basename(path)[:-3]
+        stats["md_external"] += 1
+        return f"[{label}]({web_prefix}{slug}/{anchor})"
 
     text = MD_LINK_RE.sub(link_sub, text)
+
+    # [说明](/media/x.png) 这类普通链接：打包图片时保留链接，否则退化成纯文字
+    def media_sub(m: re.Match) -> str:
+        label, url = m.group(1), m.group(2)
+        if keep_images:
+            stats["image_paths"].append(url.lstrip("/"))
+            return m.group(0)
+        stats["media_links"] += 1
+        return label
+
+    text = MEDIA_LINK_RE.sub(media_sub, text)
+
+    # 官网链接指向的文档如果就在本 CHM 里，改成本地页面；否则（Cloud、K8s、
+    # GitHub 等本 CHM 没有的内容）原样保留外链。
+    if link_index:
+        def doc_sub(m: re.Match) -> str:
+            # URL 里可能是嵌套路径（如 v8.5/tiproxy/tiproxy-overview/），取末段做 slug
+            slug = m.group(1).rstrip("/").split("/")[-1]
+            anchor = m.group(2) or ""
+            path = link_index.get(slug)
+            if not path:
+                stats["ext_kept"] += 1
+                return m.group(0)
+            stats["ext_localized"] += 1
+            return f"/{path[:-3]}.html{anchor}"
+
+        text = PINGCAP_DOC_RE.sub(doc_sub, text)
 
     def image_sub(m: re.Match) -> str:
         alt, url = m.group(1), m.group(2)
@@ -200,21 +338,35 @@ def rewrite_links(text: str, keep_images: bool, stats: dict) -> str:
 
 
 def normalize_blocks(text: str) -> str:
-    """处理 Hugo shortcode 与 SimpleTab 容器。"""
+    """处理 Hugo shortcode 与 HTML 容器。
+
+    关键点：`<div label="…">` / `<details>` 这类容器里的内容是 Markdown，
+    必须加 `markdown="1"` 交给 md_in_html 处理，否则列表、代码块、引用会
+    原样输出成一坨（``` 和 > 直接显示在正文里）。
+    """
     text = SHORTCODE_RE.sub("", text)
     text = SIMPLETAB_RE.sub("", text)
     text = DIV_LABEL_RE.sub(
-        lambda m: f'<div class="tab-pane"><p class="tab-label">{m.group(1)}</p>', text
+        lambda m: '<div class="tab-pane" markdown="1">'
+                  f'<p class="tab-label">{m.group(1)}</p>', text
     )
+    text = DETAILS_RE.sub('<details markdown="1">', text)
     text = HTML_COMMENT_RE.sub("", text)
     return text
 
 
-def clean_markdown(text: str, keep_images: bool, stats: dict) -> tuple[dict, str]:
+def clean_markdown(text: str, keep_images: bool, stats: dict,
+                   variables: dict[str, str] | None = None,
+                   link_index: dict[str, str] | None = None,
+                   included: set[str] | None = None,
+                   web_prefix: str = "") -> tuple[dict, str]:
     meta, body = split_frontmatter(text)
+    body = convert_fences(body, stats)
+    if variables:
+        body = apply_template_vars(body, variables, stats)
     body = normalize_blocks(body)
     body = strip_videos(body, stats)
-    body = rewrite_links(body, keep_images, stats)
+    body = rewrite_links(body, keep_images, stats, link_index, included, web_prefix)
     return meta, body
 
 
@@ -358,6 +510,14 @@ def render_callouts(html_text: str) -> str:
 
 def md_to_html(md_text: str) -> str:
     return markdown.markdown(md_text, extensions=MD_EXTENSIONS, output_format="html")
+
+
+BLOCK_IN_P_RE = re.compile(r"<p>\s*(<pre>.*?</pre>)\s*</p>", re.S | re.I)
+
+
+def unwrap_block_in_p(html_text: str) -> str:
+    """去掉包裹 <pre> 的 <p>（列表项内的代码块会被 Markdown 包进段落，HTML 非法）。"""
+    return BLOCK_IN_P_RE.sub(r"\1", html_text)
 
 
 CSS = """
@@ -829,25 +989,49 @@ def main() -> int:
     print(f"      章节 {len(entries)} 个，文档 {len(doc_paths)} 篇")
 
     print("[2/6] 转换 Markdown -> HTML")
-    stats = {"videos": 0, "images": 0, "image_paths": []}
+    stats = {"videos": 0, "images": 0, "image_paths": [],
+             "vars": 0, "vars_unknown": {}, "ext_localized": 0, "ext_kept": 0,
+             "md_external": 0, "code_blocks": 0, "media_links": 0}
     media_note = ("含图片资源（{} 档）".format(args.image_profile) if args.images
                   else "已移除视频与图片资源")
+    variables: dict[str, str] = {}
+    vars_text = git_read(repo, "variables.json")
+    if vars_text:
+        try:
+            variables = {str(k): str(v) for k, v in json.loads(vars_text).items()}
+        except json.JSONDecodeError:
+            print("      [警告] variables.json 解析失败，跳过模板变量替换")
     pages: dict[str, bytes] = {}
     raw_map = git_read_many(repo, doc_paths)
+    link_index = build_link_index(doc_paths, raw_map)
+    included = set(doc_paths)
+    web_prefix = ("https://docs.pingcap.com/zh/tidb/" if args.lang == "zh"
+                  else "https://docs.pingcap.com/tidb/")
+    web_prefix += (f"v{args.ref[len('release-'):]}/" if args.ref.startswith("release-")
+                   else "stable/")
     for idx, path in enumerate(doc_paths, 1):
         raw = raw_map.get(path)
         if raw is None:
             continue
         if idx % 200 == 0:
             print(f"      {idx}/{len(doc_paths)}")
-        meta, body = clean_markdown(raw, args.images, stats)
-        html_body = render_callouts(md_to_html(body))
+        meta, body = clean_markdown(raw, args.images, stats, variables, link_index,
+                                    included, web_prefix)
+        html_body = unwrap_block_in_p(render_callouts(md_to_html(body)))
         title = meta.get("title") or os.path.basename(path)[:-3].replace("-", " ").title()
         summary = meta.get("summary", "")
         page = wrap_page(title, html_body, subtitle=summary, lang=args.lang,
                          note=media_note)
         pages[path[:-3] + ".html"] = page.encode("utf-8")
     print(f"      移除视频嵌入 {stats['videos']} 处，省略图片 {stats['images']} 张")
+    print(f"      模板变量替换 {stats['vars']} 处"
+          + (f"，未知变量 {stats['vars_unknown']}" if stats["vars_unknown"] else ""))
+    print(f"      官网文档链接改内链 {stats['ext_localized']} 处，"
+          f"保留外链 {stats['ext_kept']} 处")
+    print(f"      未收录文档的站内链接改指官网 {stats['md_external']} 处，"
+          f"代码块转换 {stats['code_blocks']} 个")
+    if stats["media_links"]:
+        print(f"      未打包图片的裸链接退化为纯文本 {stats['media_links']} 处")
 
     if args.images:
         img_paths = sorted(set(stats["image_paths"]))

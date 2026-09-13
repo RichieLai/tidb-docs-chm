@@ -53,16 +53,22 @@ tidb-docs-chm/
 ```bash
 cd ~/Documents/tidb-docs-chm
 
-# 最新版（master 分支）
+# 最新版（master 分支）：默认一次出两版
+#   dist/tidb-docs-cn/tidb-docs-cn.chm               无图版       约 2.5 MB
+#   dist/tidb-docs-cn-images/tidb-docs-cn-images.chm 含图片版     约 31 MB
+#   （两版都默认压缩：含图片版 = 图片 compact 档 + CHM LZX）
 ./build.sh
 
 # 指定版本
 ./build.sh release-8.5
 
-# 含图片版（默认 compact 压缩档，约 39 MB）
+# 只出含图片版（默认 compact 图片档 + LZX 压缩）
 ./build.sh --images
 
-# 含图片、保留原图（约 124 MB）
+# 只出无图版
+./build.sh --no-images
+
+# 含图片、保留原图
 ./build.sh --images --image-profile original
 
 # 不用 LZX 压缩（改用内置打包器，产物未压缩）
@@ -83,6 +89,8 @@ cd ~/Documents/tidb-docs-chm
 5. 用 7-Zip 做完整性校验（如果安装了的话）
 6. 跑 `tools/verify_chm.py` 自检（目录来源、索引泄漏、树统计、正文编码）
 7. 清理打包中间产物（HTML/工程文件），`dist/` 里只留 CHM；打印产物路径
+
+（默认模式会按 1~7 各跑两遍：先无图版，再含图片版。）
 
 产物在 `dist/tidb-docs-cn/`（指定版本时为 `dist/tidb-docs-<分支名>/`；含图片版为
 `dist/tidb-docs-cn-images/`、`dist/tidb-docs-<分支名>-images/`）。
@@ -254,6 +262,23 @@ Windows 的 hh.exe 按需取用，但**第三方阅读器会把这些来源合�
 （`--toc-mode binary` 是需要 Windows hh.exe 原生目录时的显式选择）。
 构建结束会打印"目录卫生检查 OK"，也可随时用 `tools/verify_chm.py` 单独核对。
 
+## 7.2 正文处理约定（变量 / 容器 / 代码块 / 链接）
+
+Markdown 里有不少官网站点的私有写法，构建时统一处理成离线可读的形态：
+
+| 源文档写法 | 处理方式 |
+| --- | --- |
+| `{{{ .company }}}`、`{{{ .starter }}}` 等 Hugo 变量 | 按仓库 `variables.json` 替换（如 `PingCAP`、`TiDB Cloud Starter`）；仓库里没有的键直接去掉标记，保证正文不残留 `{{{ … }}}` |
+| `<div label="macOS">`、`<details>` 等 HTML 容器 | 加 `markdown="1"` 交给 `md_in_html` 渲染，容器里的列表/表格/引用/代码块才会成块显示（否则 `>`、```` ``` ```` 会当普通文字铺一坨） |
+| ```` ```shell ```` 围栏 | Python-Markdown 的 `fenced_code` **不认列表项内缩进 4 空格的围栏**（会渲染成行内 `code`），构建时统一转成 `<pre><code>` 再交给 Markdown |
+| 站内 `/x.md` 链接（本 CHM 内） | 改成本地 `/x.html`（保留 `#锚点`） |
+| 站内 `/x.md` 链接（**未**收录进 CHM） | 改指官网 `https://docs.pingcap.com/zh/tidb/stable/<slug>/`，避免留下点不开的站内链接 |
+| 官网自管理文档链接（本 CHM 内有同页） | 改成本地页面 |
+| Cloud / Kubernetes / GitHub 等本 CHM 没有的内容 | 保持外链（离线时点开会提示联网） |
+| `[说明](/media/x.png)` 这类裸媒体链接 | 打包图片时保留链接；未打包图片时退化为纯文本 |
+
+构建产物实测：本地链接 9109 个、**断链 0**，图片引用缺失 0。
+
 ## 8. 实现说明
 
 CHM 是微软专有格式，官方编译器只能在 Windows 上运行。本工具在 macOS/Linux
@@ -326,8 +351,14 @@ macOS 上无法直接验证 hh.exe 行为。用 `docs.hhp` 在 Windows 上
 **CHM 压缩是怎么做的？体积能到多少？**
 直接复用 Free Pascal 自带的 `chmcmd`（内含 LZX 实现），不自己写压缩器：
 `brew install fpc` 后 `./build.sh` 会自动用它。无图版 9.9 MB → **2.5 MB**，
-含图版（compact 档）39.4 MB → **30.7 MB**。没装 FPC 时自动退回内置打包器
+含图版（compact 档）37.9 MB → **30.9 MB**。没装 FPC 时自动退回内置打包器
 （未压缩，功能一致），也可用 `--no-compress` 显式指定。详见 §5"压缩（LZX）说明"。
+
+**为什么有的链接还是跳到官网？**
+分两种情况：① 目标页面就在本 CHM 里 —— 已经改成本地跳转，共 56 处；
+② 目标不在本 CHM 里（未收录的 TiDB 文档、TiDB Cloud、Kubernetes、GitHub 等）
+—— 保持外链，离线点开会提示联网。站内 `.md` 链接若指向未收录页面，也会改指官网，
+不会留下点不开的本地链接。当前产物断链 0、图片缺失 0（见 §7.2）。
 
 **生成的文档里有视频吗？**
 没有。构建时删除全部 `<iframe>`/`<video>`/YouTube、Bilibili 嵌入及其引导句；
