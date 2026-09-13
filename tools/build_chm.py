@@ -18,6 +18,7 @@ import argparse
 import html as html_lib
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -697,7 +698,14 @@ def collect_entries(entries: list[TocEntry]) -> list[TocEntry]:
     return out
 
 
-def build_hhp(title: str, chm_name: str, files: list[str], lang: str = "en") -> str:
+def build_hhp(title: str, chm_name: str, files: list[str], lang: str = "en",
+              target: str = "hhc") -> str:
+    """生成 HTML Help 工程文件。
+
+    target="hhc"    —— 给 Windows 官方 `hhc.exe` 用：带索引与全文搜索（Windows 侧完整功能）
+    target="chmcmd" —— 给 FPC 的 `chmcmd` 用：不写索引文件，避免第三方阅读器
+                      把索引条目平铺追加到目录树末尾（macOS 阅读器的已知行为）
+    """
     # hhp 是 hhc.exe 按 ANSI 读的，Language 行保持纯 ASCII，避免编码问题
     lang_line = "0x0804 Simplified Chinese" if lang == "zh" else "0x0409 English (United States)"
     lines = [
@@ -705,18 +713,19 @@ def build_hhp(title: str, chm_name: str, files: list[str], lang: str = "en") -> 
         "Compatibility=1.1 or later",
         f"Compiled file={chm_name}",
         "Contents file=toc.hhc",
-        "Index file=index.hhk",
         "Default topic=index.html",
         f"Title={title}",
         f"Language={lang_line}",
         "Binary TOC=Yes",
-        "Binary Index=Yes",
-        "Full-text search=Yes",
+        f"Binary Index={'Yes' if target == 'hhc' else 'No'}",
+        f"Full-text search={'Yes' if target == 'hhc' else 'No'}",
         "Create CHI file=No",
         "Display compile progress=No",
         "",
         "[FILES]",
     ]
+    if target == "hhc":
+        lines.insert(4, "Index file=index.hhk")
     lines.extend(files)
     lines.extend(["", "[INFOTYPES]", ""])
     return "\n".join(lines)
@@ -746,6 +755,9 @@ def main() -> int:
                     help="打包完成后清理中间产物：none=保留 HTML 版与工程文件（默认）；"
                          "hhp=只留 *.chm + docs.hhp/toc.hhc/index.hhk（Windows 重编用）；"
                          "chm=只留 *.chm")
+    ap.add_argument("--compiler", default="auto", choices=["auto", "builtin", "chmcmd"],
+                    help="打包器：auto=有 FPC 的 chmcmd 就用它（LZX 压缩，体积约 1/3），"
+                         "否则用内置打包器；builtin=内置（不压缩）；chmcmd=强制使用并报错")
     ap.add_argument("--image-profile", default="original",
                     choices=sorted(IMAGE_PROFILES),
                     help="图片压缩档位：original=原图（默认）；"
@@ -906,22 +918,45 @@ def main() -> int:
             fh.write(data)
 
     print("[5/6] 打包 CHM")
-    writer = ChmWriter(
-        title=args.title,
-        default_page="index.html",
-        language_id=0x0804 if args.lang == "zh" else 0x0409,
-        toc_name="toc.hhc",
-        index_name="",  # 不声明索引：避免阅读器把索引条目平铺进目录树
-        include_binary_toc=(args.toc_mode == "binary"),
-    )
-    for name in file_list:
-        if name in skip_in_chm:
-            continue
-        writer.add_file(name, pages[name])
-    for node in to_chm_toc(entries):
-        writer.add_toc(node)
     chm_path = os.path.join(out, args.chm)
-    writer.write(chm_path)
+    chm_files = [f for f in file_list if f not in skip_in_chm]
+    compiler = args.compiler
+    if compiler == "auto":
+        compiler = "chmcmd" if shutil.which("chmcmd") else "builtin"
+    if compiler == "chmcmd" and not shutil.which("chmcmd"):
+        print("      找不到 chmcmd（Free Pascal 的 CHM 编译器）："
+              "brew install fpc，或改用 --compiler builtin", file=sys.stderr)
+        return 1
+
+    chmcmd_hhp = ""
+    if compiler == "chmcmd":
+        # chmcmd 自带 LZX 压缩实现；不写索引，保持侧栏干净
+        chmcmd_hhp = "docs.chmcmd.hhp"
+        with open(os.path.join(out, chmcmd_hhp), "wb") as fh:
+            fh.write(build_hhp(args.title, args.chm, chm_files, args.lang,
+                               target="chmcmd").encode("gbk"))
+        res = subprocess.run(["chmcmd", "--no-html-scan", chmcmd_hhp],
+                             cwd=out, capture_output=True)
+        if res.returncode != 0 or not os.path.exists(chm_path):
+            print("      chmcmd 编译失败：", res.stderr.decode("utf-8", "replace")[-500:],
+                  file=sys.stderr)
+            return 1
+        print(f"      chmcmd（Free Pascal，LZX 压缩）完成，"
+              f"未压缩时约 {sum(len(pages[f]) for f in chm_files) / 1048576:.1f} MB")
+    else:
+        writer = ChmWriter(
+            title=args.title,
+            default_page="index.html",
+            language_id=0x0804 if args.lang == "zh" else 0x0409,
+            toc_name="toc.hhc",
+            index_name="",  # 不声明索引：避免阅读器把索引条目平铺进目录树
+            include_binary_toc=(args.toc_mode == "binary"),
+        )
+        for name in chm_files:
+            writer.add_file(name, pages[name])
+        for node in to_chm_toc(entries):
+            writer.add_toc(node)
+        writer.write(chm_path)
 
     print("[6/6] 校验")
     from chmwriter import ChmReader
@@ -935,11 +970,21 @@ def main() -> int:
     if args.toc_mode == "binary":
         ok_toc = reader.read("/#TOCIDX")[:4] == struct_pack_blocksize()
         print(f"      #TOCIDX 头部校验 {'OK' if ok_toc else '失败'}")
-    sample = reader.read("/index.html")
     print(f"      文件条目 {len(reader.files)} 个，缺失 {len(missing)} 个")
     if missing:
         print("      缺失：", missing[:10])
-    print(f"      index.html 回读 {len(sample)} 字节")
+    if chm_content_readable(reader):
+        print(f"      index.html 回读 {len(reader.read('/index.html'))} 字节")
+    else:
+        # LZX 压缩：用 chmcmd 自带的 chmls 解包，与打包前的源文件逐个字节比对
+        extracted, total = verify_compressed_content(chm_path, out, chm_files)
+        if extracted is None:
+            print("      [提示] 未找到 chmls，跳过压缩内容比对（brew install fpc）")
+        else:
+            print(f"      解压比对：{extracted}/{total} 个文件与源文件字节一致")
+            if extracted != total:
+                print("      [失败] 压缩包内容与源文件不一致", file=sys.stderr)
+                return 1
 
     # 目录卫生检查：侧栏目录只允许来自 toc.hhc。
     # 索引文件（*.hhk）与二进制目录树会被第三方阅读器合并进目录面板，
@@ -957,7 +1002,10 @@ def main() -> int:
     if leaked_index:
         hygiene_ok = False
         print(f"      [失败] CHM 内混入索引文件：{leaked_index}")
-    if binary_entries and args.toc_mode != "binary":
+    if binary_entries and compiler == "chmcmd":
+        print("      （附带二进制目录树：Windows hh.exe 原生导航用，"
+              "实测不影响第三方阅读器，因为同时有 toc.hhc 且无索引）")
+    elif binary_entries and args.toc_mode != "binary":
         hygiene_ok = False
         print(f"      [失败] CHM 内混入二进制目录树：{binary_entries}")
     if hygiene_ok:
@@ -969,7 +1017,8 @@ def main() -> int:
         keep = {args.chm}
         if args.prune == "hhp":
             keep |= {"docs.hhp", "toc.hhc", "index.hhk"}
-        removed, freed = prune_out_dir(out, [*file_list, "docs.hhp"], keep)
+        removed, freed = prune_out_dir(
+            out, [*file_list, "docs.hhp", *([chmcmd_hhp] if chmcmd_hhp else [])], keep)
         print(f"      清理中间产物 {removed} 个（-{freed / 1048576:.1f} MB），"
               f"只保留：{'、'.join(sorted(keep))}")
 
@@ -999,6 +1048,42 @@ def prune_entries(entries: list[TocEntry], allowed: set[str]) -> list[TocEntry]:
         elif children:
             out.append(TocEntry(e.title, "", children))
     return out
+
+
+def chm_content_readable(reader) -> bool:
+    """CHM 内容是否为可直接读取（未压缩）的形态。"""
+    try:
+        head = reader.read("/index.html")[:16]
+    except KeyError:
+        return False
+    return head.startswith((b"\xef\xbb\xbf", b"<", b"\n", b"\r", b" "))
+
+
+def verify_compressed_content(chm_path: str, out: str,
+                              names: list[str]) -> tuple[int | None, int]:
+    """用 FPC 的 chmls 解包（LZX）压缩 CHM，与打包前的源文件逐字节比对。
+
+    返回 (一致文件数, 应比对文件数)；chmls 不可用时一致数为 None。
+    """
+    if not shutil.which("chmls"):
+        return None, len(names)
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        res = subprocess.run(["chmls", "extractall", chm_path, tmp],
+                             capture_output=True)
+        if res.returncode != 0:
+            return 0, len(names)
+        same = 0
+        for name in names:
+            src = os.path.join(out, name)
+            got = os.path.join(tmp, name)
+            if not (os.path.isfile(src) and os.path.isfile(got)):
+                continue
+            with open(src, "rb") as a, open(got, "rb") as b:
+                if a.read() == b.read():
+                    same += 1
+        return same, len(names)
 
 
 def prune_out_dir(out: str, written: list[str], keep: set[str]) -> tuple[int, int]:

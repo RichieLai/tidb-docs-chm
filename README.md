@@ -44,6 +44,8 @@ tidb-docs-chm/
 - git（克隆文档仓库）
 - 可选：`pillow`（`--images` 压缩图片用；`build.sh --images` 会自动安装。
   没装时退回 macOS 自带 `sips`，只能降采样、不能做调色板量化）
+- 可选：Free Pascal（`brew install fpc`）——提供 `chmcmd`，用于 **LZX 压缩 CHM**
+  （体积约为未压缩的 1/3～1/4）；没装时自动退回内置打包器输出未压缩 CHM
 - 可选：7-Zip（`7zz`，用于产物独立校验；没有则自动跳过校验步骤）
 
 ## 3. 一键生成（推荐）
@@ -63,6 +65,9 @@ cd ~/Documents/tidb-docs-chm
 # 含图片、保留原图（约 124 MB）
 ./build.sh --images --image-profile original
 
+# 不用 LZX 压缩（改用内置打包器，产物未压缩）
+./build.sh --no-compress
+
 # 需要浏览器可读的 HTML 版 / Windows 重编工程（不清理中间产物）
 ./build.sh --keep-html
 ./build.sh --keep-hhp
@@ -73,10 +78,11 @@ cd ~/Documents/tidb-docs-chm
 1. 创建/复用 Python 虚拟环境，安装 `markdown`（含图片版再加 `pillow`）
 2. 首次运行克隆文档仓库到 `repos/docs-cn`（约 400 MB，体积过滤只取 Markdown，约 1 分钟）；
    之后每次运行增量更新到目标分支最新
-3. 解析官方目录 `TOC.md`，转换全部文档，打包 CHM 到 `dist/`（约 30 秒）
-4. 用 7-Zip 做完整性校验（如果安装了的话）
-5. 跑 `tools/verify_chm.py` 自检（目录来源、索引泄漏、树统计、正文编码）
-6. 清理打包中间产物（HTML/工程文件），`dist/` 里只留 CHM；打印产物路径
+3. 解析官方目录 `TOC.md`，转换全部文档
+4. 用 `chmcmd`（装了 FPC 的话）做 **LZX 压缩**打包到 `dist/`，否则用内置打包器
+5. 用 7-Zip 做完整性校验（如果安装了的话）
+6. 跑 `tools/verify_chm.py` 自检（目录来源、索引泄漏、树统计、正文编码）
+7. 清理打包中间产物（HTML/工程文件），`dist/` 里只留 CHM；打印产物路径
 
 产物在 `dist/tidb-docs-cn/`（指定版本时为 `dist/tidb-docs-<分支名>/`；含图片版为
 `dist/tidb-docs-cn-images/`、`dist/tidb-docs-<分支名>-images/`）。
@@ -127,6 +133,7 @@ python3 tools/build_chm.py --repo repos/docs-cn --out dist/tidb-docs-cn-images \
 | `--ref <branch>` | 按版本分支生成，自动 `git fetch` 并切换，如 `release-8.5` |
 | `--lang zh/en` | 中文（GBK 目录 + 0x0804）/ 英文（0x0409），默认 zh |
 | `--images` | 打包文档引用的图片；默认省略（原位留灰色占位提示） |
+| `--compiler auto/builtin/chmcmd` | 打包器：`auto`（默认）= 有 `chmcmd` 就做 **LZX 压缩**，否则用内置打包器；`builtin` = 内置（未压缩）；`chmcmd` = 强制并报错 |
 | `--image-profile original/compact/tiny` | 图片压缩档位，默认 `original`（见下文"图片压缩说明"） |
 | `--image-max-width N` | 覆盖档位：最大宽度（像素，0=不缩放） |
 | `--image-colors N` | 覆盖档位：PNG 调色板色数（0=保持真彩） |
@@ -173,6 +180,35 @@ CHM 自身不做压缩，图片原样入库时体积很大，因此提供三档�
 - 压完反而更大的图，保留原图（构建日志会给出压缩张数/保留张数）
 - 只想降采样、不想要调色板：`--image-colors 0`
 
+### 压缩（LZX）说明（--compiler）
+
+CHM 支持 LZX 压缩，但格式是微软专有的，官方编码器只在 Windows 的
+`hhc.exe` 里。macOS/Linux 上不自己造轮子，直接复用 **Free Pascal 自带的
+`chmcmd`**（`packages/chm` 内含 `paslzxcomp` 的 LZX 实现）：
+
+```bash
+brew install fpc        # 提供 chmcmd / chmls
+./build.sh              # 默认 --compiler auto：有 chmcmd 就用它压缩
+```
+
+| 产物 | 内置打包器（未压缩） | `chmcmd`（LZX） |
+| --- | --- | --- |
+| 无图版 | 9.9 MB | **2.5 MB** |
+| 含图版（compact 档） | 39.4 MB | **30.7 MB** |
+
+（含图版压缩收益小，因为 PNG/JPEG 本身已压缩，LZX 主要压缩 HTML 文本。）
+
+实现细节与取舍：
+
+- `chmcmd` 用的工程文件是另写的 `docs.chmcmd.hhp`：**不写索引文件**、关掉全文索引，
+  这样第三方阅读器不会把索引条目平铺进侧栏（Windows 官方导航用二进制目录树，
+  实测与 `toc.hhc` 共存时侧栏仍正常）
+- `docs.hhp` 仍是给 Windows `hhc.exe` 用的完整工程（含索引 + 全文搜索），
+  `--keep-hhp` 才保留
+- 压缩后构建会调用 FPC 的 `chmls` 把 CHM 解包，与打包前的源文件**逐字节比对**
+  （无图版 834/834、含图版 1303/1303 一致才通过）
+- 没装 FPC 时自动退回内置打包器（产物未压缩，功能一致），或用 `--no-compress` 显式指定
+
 ## 6. 产物清单
 
 默认（`--prune chm`）`dist/` 里**只有 CHM**；下表其余文件是打包中间产物／可选产物：
@@ -180,7 +216,7 @@ CHM 自身不做压缩，图片原样入库时体积很大，因此提供三档�
 | 文件 | 用途 |
 | --- | --- |
 | `*.chm` | 离线文档本体，Windows 双击用 hh.exe 打开，左侧目录树可折叠 |
-| `tidb-docs-cn.chm` / `tidb-docs-cn-images.chm` | 无图版（约 9.7 MB，默认）/ 含图片版（compact 档约 38.5 MB） |
+| `tidb-docs-cn.chm` / `tidb-docs-cn-images.chm` | 无图版（LZX 后约 2.5 MB）/ 含图片版（compact 档 LZX 后约 30.7 MB） |
 | `docs.hhp`（`--keep-hhp` 保留） | HTML Help 工程文件。Windows 上执行 `hhc.exe docs.hhp` 可用微软官方编译器重新编译（产物为 LZX 压缩的标准 CHM，体积约 1/3） |
 | `toc.hhc`（`--keep-hhp` 保留） | 官方格式的目录源文件，**已打包进 CHM**（侧栏目录的唯一来源），磁盘上这份是给 `hhc.exe` 用的 |
 | `index.hhk`（`--keep-hhp` 保留） | 官方格式的索引源文件，**不打进 CHM**（原因见下），只在磁盘上给 `hhc.exe` 用 |
@@ -221,7 +257,8 @@ Windows 的 hh.exe 按需取用，但**第三方阅读器会把这些来源合�
 ## 8. 实现说明
 
 CHM 是微软专有格式，官方编译器只能在 Windows 上运行。本工具在 macOS/Linux
-上从零实现了 ITSF 容器：
+上从零实现了 ITSF 容器（`chmwriter.py`），用于**不依赖 FPC** 也能出包；
+若要 LZX 压缩，则改走 FPC 的 `chmcmd`（见 §5"压缩（LZX）说明"）：
 
 - ITSF / ITSP / PMGL / PMGI 头部与目录块，section 0 带 0x18 字节 `0x01FE` 前缀头
 - `/#SYSTEM` 系统文件
@@ -229,7 +266,7 @@ CHM 是微软专有格式，官方编译器只能在 Windows 上运行。本工�
   （hh.exe 只认二进制目录树，仅提供 `.hhc` 时左侧导航不会显示）
 - 目录树节点按深度优先顺序写入（子节点紧跟父节点），兼容依赖
   "线性顺序 + 父指针"恢复层级的第三方阅读器
-- 未压缩存储（微软格式允许的合法形态），兼容性最好
+- 内置打包器为未压缩存储（微软格式允许的合法形态）；LZX 压缩由 `chmcmd` 负责
 
 二进制布局参考：chmlib（`src/chm_lib.c`）、Free Pascal `packages/chm`、
 7-Zip 源码 `CPP/7zip/Archive/Chm/ChmIn.cpp`。
@@ -241,11 +278,13 @@ python3 tools/verify_chm.py dist/tidb-docs-cn/tidb-docs-cn.chm   # 目录卫生�
 7zz t dist/tidb-docs-cn/tidb-docs-cn.chm          # 完整性测试 -> Everything is Ok
 7zz l dist/tidb-docs-cn/tidb-docs-cn.chm          # 列出全部条目
 7zz x dist/tidb-docs-cn/tidb-docs-cn.chm -o/tmp/c # 提取（加 --keep-html 构建后可与源 HTML 逐字节比对）
+chmls extractall dist/tidb-docs-cn/tidb-docs-cn.chm /tmp/c  # FPC 的 chmls 解包（压缩包用）
 ```
 
-`verify_chm.py` 输出示例（目录源 / 索引 / 树统计 / 链接缺失 / 正文编码）：
+`verify_chm.py` 输出示例（压缩方式 / 目录源 / 索引 / 树统计 / 链接缺失 / 正文编码）：
 
 ```
+压缩方式  : LZX 压缩（内容已用 chmls 解包核对）
 目录源    : /toc.hhc
 索引文件  : 无
 目录树    : 顶层章节 14 个，节点 949 个，最大层级 6 级
@@ -284,11 +323,11 @@ macOS 第三方阅读器（CHM 阅读器-畅享版 / CHM Reader - Enjoy）对**�
 macOS 上无法直接验证 hh.exe 行为。用 `docs.hhp` 在 Windows 上
 `hhc.exe docs.hhp` 重编一次即可得到微软官方标准 CHM，作为兜底。
 
-**为什么 CHM 没有压缩？**
-未压缩存储是微软格式允许的合法形态。从零实现 LZX 编码器的语义成本
-过高（位流、限长霍夫曼、reset 语义、x86 E8 变换等十余处细节需逐一对齐），
-未压缩形态已双重验证字节级正确。需要压缩体积时用 `docs.hhp` 走官方
-`hhc.exe` 编译，产物约为当前体积的 1/3。
+**CHM 压缩是怎么做的？体积能到多少？**
+直接复用 Free Pascal 自带的 `chmcmd`（内含 LZX 实现），不自己写压缩器：
+`brew install fpc` 后 `./build.sh` 会自动用它。无图版 9.9 MB → **2.5 MB**，
+含图版（compact 档）39.4 MB → **30.7 MB**。没装 FPC 时自动退回内置打包器
+（未压缩，功能一致），也可用 `--no-compress` 显式指定。详见 §5"压缩（LZX）说明"。
 
 **生成的文档里有视频吗？**
 没有。构建时删除全部 `<iframe>`/`<video>`/YouTube、Bilibili 嵌入及其引导句；
@@ -300,7 +339,8 @@ macOS 上无法直接验证 hh.exe 行为。用 `docs.hhp` 在 Windows 上
 约为原图版的 1/3）；`--image-profile tiny` 整包约 31 MB。
 更细的控制用 `--image-max-width`（缩放宽度）、`--image-colors`（调色板色数）、
 `--image-jpeg-quality`（JPEG 质量）；`--image-colors 0 --image-max-width 1600`
-则是"只降采样、不动颜色"。CHM 本身不做 LZX 压缩，所以体积主要由图片决定。
+则是"只降采样、不动颜色"。含图版的体积主要由图片决定（LZX 对已压缩的
+PNG/JPEG 收益很小，主要压缩 HTML 文本）。
 
 **为什么 `dist/` 下只有 CHM，HTML 是中间产物吗？**
 
@@ -335,8 +375,8 @@ CHM 内图片用的是 `/media/...` 绝对路径，`file://` 直接打开 HTML �
 
 ## 11. 已知限制
 
-- 未压缩存储，体积约为官方 LZX 压缩产物的 3 倍（压缩路径见上文 `docs.hhp`）
+- LZX 压缩依赖第三方 `chmcmd`（FPC）；未安装时退回内置打包器，产物未压缩
 - hh.exe 实际渲染效果无法在 macOS 上验证，兜底方案同上
 - 站外链接不做转换
-- 搜索索引未生成（CHM 内置全文搜索依赖 `/#IVB` 等文件，未实现）；
-  Windows 端 `hhc.exe` 重编可获得完整全文搜索
+- 搜索索引未生成（我们用 `chmcmd` 时关掉了全文索引以保持侧栏干净）；
+  需要搜索索引可用 `--keep-hhp` 后在 Windows 端 `hhc.exe` 重编

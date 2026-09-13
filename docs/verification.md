@@ -74,15 +74,38 @@
 [`screenshots/06-encoding-default-images.jpg`](screenshots/06-encoding-default-images.jpg)
 （两版都在 `Default` 编码下正常显示）。
 
-## 4. 通用复核清单
+## 4. LZX 压缩
+
+**做法**：不自己写压缩器，直接复用 Free Pascal 的 `chmcmd`（`packages/chm`
+内含 `paslzxcomp` 的 LZX 实现）。`build_chm.py --compiler auto`（`build.sh` 默认）
+在检测到 `chmcmd` 时用它打包，否则退回内置打包器输出未压缩 CHM。
+
+| 产物 | 内置打包器（未压缩） | `chmcmd`（LZX） | 降幅 |
+| --- | --- | --- | --- |
+| 无图版 | 9.92 MB | **2.52 MB** | -75% |
+| 含图版（compact 档） | 39.43 MB | **30.73 MB** | -22% |
+
+**目录形态不变**：`chmcmd` 用的 `docs.chmcmd.hhp` 不写索引文件、关掉全文索引，
+只保留二进制目录树（Windows hh.exe 原生导航）+ `toc.hhc`。实测该组合在
+macOS 阅读器侧栏仍干净（用"有索引 / 无索引"两个变体对照复现过）。
+
+**正确性验证**：构建时用 FPC 的 `chmls extractall` 把压缩 CHM 解包，与打包前的
+源文件逐个字节比对——无图版 834/834、含图版 1303/1303 全部一致；另外
+`7zz t` 报 `Everything is Ok`，阅读器实测中文、图片、目录树均正常。
+
+**证据**：[`screenshots/07-lzx-compressed.jpg`](screenshots/07-lzx-compressed.jpg)
+（2.5 MB 的 LZX 压缩产物在阅读器中的效果）。
+
+## 5. 通用复核清单
 
 ```bash
 ./build.sh && ./build.sh --images
 python3 tools/verify_chm.py dist/tidb-docs-cn/tidb-docs-cn.chm
 python3 tools/verify_chm.py dist/tidb-docs-cn-images/tidb-docs-cn-images.chm
 7zz t dist/tidb-docs-cn/tidb-docs-cn.chm          # Everything is Ok
+chmls extractall dist/tidb-docs-cn/tidb-docs-cn.chm /tmp/c   # 压缩包解包核对
 ```
 
 期望结果：顶层章节 14 个 / 节点 949 个 / 最大层级 6 级 / 833 个链接 0 缺失 /
-无索引文件 / 829 个 HTML 全部带 UTF-8 BOM / `dist/` 下只留 CHM（中间产物已清理）。
+无索引文件 / 829 个 HTML 全部带 UTF-8 BOM / LZX 压缩 / `dist/` 下只留 CHM。
 阅读器侧请**先退出或用 ⌘W 关闭旧文档**，再打开新产物。

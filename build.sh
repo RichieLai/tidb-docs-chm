@@ -8,8 +8,10 @@
 #   ./build.sh --images       # 生成含图片版（默认 compact 压缩档）
 #   ./build.sh --images --image-profile original   # 含图片但保留原图
 #   ./build.sh --keep-html    # 额外保留 HTML 版与 hhc/hhp 工程文件
+#   ./build.sh --no-compress  # 不用 chmcmd 的 LZX 压缩（改用内置打包器）
 #
 # 产物默认只保留 CHM；HTML/工程文件是打包用中间产物，构建成功后自动清理。
+# CHM 默认用 FPC 的 chmcmd 做 LZX 压缩（体积约 1/3），没装 chmcmd 时自动退回内置打包器。
 # 幂等可重复执行：venv、源码仓库、产物均自动准备/更新。
 set -euo pipefail
 
@@ -24,11 +26,21 @@ REF="master"
 WITH_IMAGES=0
 HAS_PROFILE=0
 PRUNE="chm"
+COMPILER="auto"
 IMAGE_ARGS=()
 for arg in "$@"; do
     case "$arg" in
         --images|--keep-images)
             WITH_IMAGES=1
+            ;;
+        --compiler=*)
+            COMPILER="${arg#--compiler=}"
+            ;;
+        --no-compress)
+            COMPILER="builtin"
+            ;;
+        --compress)
+            COMPILER="chmcmd"
             ;;
         --keep-html|--keep-all)
             PRUNE="none"
@@ -49,7 +61,7 @@ for arg in "$@"; do
             IMAGE_ARGS+=("$arg")
             ;;
         --*)
-            echo "未知参数：${arg}（支持 --images、--image-*、--keep-html、--keep-hhp）" >&2
+            echo "未知参数：${arg}（支持 --images、--image-*、--keep-html、--keep-hhp、--no-compress）" >&2
             exit 2
             ;;
         *)
@@ -118,6 +130,7 @@ BUILD_ARGS=(
     --title "$TITLE"
     --chm "$CHM"
     --prune "$PRUNE"
+    --compiler "$COMPILER"
     --all --lang zh
 )
 if [ "$WITH_IMAGES" = 1 ]; then
