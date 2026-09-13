@@ -1,0 +1,992 @@
+#!/usr/bin/env python3
+"""
+build_chm.py —— 把 pingcap/docs 的 Markdown 文档打包成 CHM。
+
+设计目标：
+  1. 体积小：默认剔除 media 图片与全部视频嵌入，去掉 Hugo 短代码与站内冗余脚本
+  2. 无视频：删除 <iframe> / <video> / YouTube、Bilibili 等嵌入及其引导句
+  3. 优雅：统一 CSS（按 hh.exe 的 IE 渲染引擎能力编写，不使用 flex/grid/var）
+  4. 可复现：同时输出 .hhp/.hhc/.hhk + HTML，可在 Windows 上用官方 hhc.exe 重新编译
+
+用法：
+    python3 build_chm.py --repo ../src/docs --out ../out --sections "Get Started,Deploy"
+"""
+
+from __future__ import annotations
+
+import argparse
+import html as html_lib
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import markdown  # noqa: E402
+
+from chmwriter import ChmWriter, TocNode  # noqa: E402
+
+MD_EXTENSIONS = ["extra", "sane_lists", "toc", "attr_list", "md_in_html"]
+
+CALLOUT_KINDS = ("Note", "Tip", "Warning", "Caution", "Important", "Note ")
+
+# 正文 HTML 统一带 UTF-8 BOM。hh.exe/第三方阅读器默认按系统 ANSI（中文=
+# CP936）解码，只声明 <meta charset> 不够；带 BOM 时它们会优先按 UTF-8 解码，
+# 打开即正常显示中文，不必手动切换"文本编码"。
+UTF8_BOM = b"\xef\xbb\xbf"
+
+
+# --------------------------------------------------------------------------
+# 目录树
+# --------------------------------------------------------------------------
+
+@dataclass
+class Doc:
+    path: str            # 仓库内路径，如 br/backup-and-restore-overview.md
+    title: str = ""
+    summary: str = ""
+    html_name: str = ""  # CHM 内路径，如 br/backup-and-restore-overview.html
+
+
+@dataclass
+class TocEntry:
+    title: str
+    path: str = ""
+    children: list = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------
+# 读取
+# --------------------------------------------------------------------------
+
+def git_read(repo: str, path: str) -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo, "show", f"HEAD:{path}"],
+            capture_output=True,
+            check=True,
+        )
+        return out.stdout.decode("utf-8", "replace")
+    except subprocess.CalledProcessError:
+        return None
+
+
+def git_exists(repo: str, path: str) -> bool:
+    res = subprocess.run(
+        ["git", "-C", repo, "cat-file", "-e", f"HEAD:{path}"],
+        capture_output=True,
+    )
+    return res.returncode == 0
+
+
+def git_file_set(repo: str) -> set[str]:
+    """一次性取回仓库全部路径，避免逐文件 fork git。"""
+    out = subprocess.run(
+        ["git", "-C", repo, "ls-tree", "-r", "--name-only", "HEAD"],
+        capture_output=True,
+        check=True,
+    )
+    return set(out.stdout.decode("utf-8", "replace").splitlines())
+
+
+def git_read_many_raw(repo: str, paths: list[str]) -> dict[str, bytes]:
+    """用单次 git cat-file --batch 批量读取文件原始字节。"""
+    if not paths:
+        return {}
+    query = "".join(f"HEAD:{p}\n" for p in paths).encode()
+    proc = subprocess.run(
+        ["git", "-C", repo, "cat-file", "--batch"],
+        input=query,
+        capture_output=True,
+    )
+    data = proc.stdout
+    result: dict[str, bytes] = {}
+    pos = 0
+    for path in paths:
+        nl = data.find(b"\n", pos)
+        if nl < 0:
+            break
+        parts = data[pos:nl].decode("utf-8", "replace").split()
+        if len(parts) < 3 or parts[1] != "blob":
+            pos = nl + 1
+            continue
+        size = int(parts[2])
+        start = nl + 1
+        result[path] = data[start:start + size]
+        pos = start + size + 1  # 末尾还有一个换行
+    return result
+
+
+def git_read_many(repo: str, paths: list[str]) -> dict[str, str]:
+    return {
+        p: b.decode("utf-8", "replace")
+        for p, b in git_read_many_raw(repo, paths).items()
+    }
+
+
+# --------------------------------------------------------------------------
+# 清洗
+# --------------------------------------------------------------------------
+
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.S)
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+IFRAME_RE = re.compile(r"<\s*(iframe|video|source)\b.*?<\s*/\s*\1\s*>", re.S | re.I)
+IFRAME_VOID_RE = re.compile(r"<\s*(iframe|video|source)\b[^>]*/?\s*>", re.I)
+VIDEO_LEAD_RE = re.compile(
+    r"^\s*(?:The following video[^.\n]*\.|Watch the following video[^.\n]*\.|"
+    r"下列视频[^。\n]*。)\s*$",
+    re.M | re.I,
+)
+SHORTCODE_RE = re.compile(r"\{\{<.*?>\}\}", re.S)
+SIMPLETAB_RE = re.compile(r"</?SimpleTab[^>]*>", re.I)
+DIV_LABEL_RE = re.compile(r'<div\s+label="([^"]*)"\s*>', re.I)
+IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((/[^)\s]+\.md)(#[^)\s]*)?\)")
+
+
+def split_frontmatter(text: str) -> tuple[dict, str]:
+    meta: dict[str, str] = {}
+    m = FRONTMATTER_RE.match(text)
+    if m:
+        for line in m.group(1).splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                meta[k.strip()] = v.strip().strip("'\"")
+        text = text[m.end():]
+    return meta, text
+
+
+def strip_videos(text: str, stats: dict) -> str:
+    """删除 iframe/video 嵌入及其引导句。"""
+    before = text
+    text = IFRAME_RE.sub("", text)
+    text = IFRAME_VOID_RE.sub("", text)
+    text = VIDEO_LEAD_RE.sub("", text)
+    # 仅指向视频站点的链接行
+    text = re.sub(
+        r"^\s*\[[^\]]*\]\((https?://(?:www\.)?(?:youtube\.com|youtu\.be|bilibili\.com|"
+        r"player\.bilibili\.com|vimeo\.com)[^)]*)\)\s*$",
+        "",
+        text,
+        flags=re.M | re.I,
+    )
+    if text != before:
+        stats["videos"] += len(IFRAME_RE.findall(before)) + len(IFRAME_VOID_RE.findall(before))
+    return text
+
+
+def rewrite_links(text: str, keep_images: bool, stats: dict) -> str:
+    """站内 .md 链接 -> .html；图片按策略保留或省略。"""
+    def link_sub(m: re.Match) -> str:
+        label, target, anchor = m.group(1), m.group(2), m.group(3) or ""
+        return f"[{label}]({target[:-3]}.html{anchor})"
+
+    text = MD_LINK_RE.sub(link_sub, text)
+
+    def image_sub(m: re.Match) -> str:
+        alt, url = m.group(1), m.group(2)
+        if keep_images:
+            stats["image_paths"].append(url.lstrip("/"))
+            return f"![{alt}]({url})"
+        stats["images"] += 1
+        label = html_lib.escape(alt or "illustration")
+        return f'<p class="img-missing">[图片已省略] {label}</p>'
+
+    text = IMAGE_RE.sub(image_sub, text)
+    return text
+
+
+def normalize_blocks(text: str) -> str:
+    """处理 Hugo shortcode 与 SimpleTab 容器。"""
+    text = SHORTCODE_RE.sub("", text)
+    text = SIMPLETAB_RE.sub("", text)
+    text = DIV_LABEL_RE.sub(
+        lambda m: f'<div class="tab-pane"><p class="tab-label">{m.group(1)}</p>', text
+    )
+    text = HTML_COMMENT_RE.sub("", text)
+    return text
+
+
+def clean_markdown(text: str, keep_images: bool, stats: dict) -> tuple[dict, str]:
+    meta, body = split_frontmatter(text)
+    body = normalize_blocks(body)
+    body = strip_videos(body, stats)
+    body = rewrite_links(body, keep_images, stats)
+    return meta, body
+
+
+# --------------------------------------------------------------------------
+# 图片压缩（--image-profile）
+# --------------------------------------------------------------------------
+
+# 文档里的图以 UI 截图/监控面板为主（PNG 真彩、单张 1~4 MB）。
+# PNG 调色板量化 + 降采样对这类图收益最大，且文字仍然清晰；
+# 照片类（.jpg）按质量重编码。
+IMAGE_PROFILES = {
+    "original": {"max_width": 0, "png_colors": 0, "jpeg_quality": 0},
+    "compact": {"max_width": 1200, "png_colors": 256, "jpeg_quality": 82},
+    "tiny": {"max_width": 1000, "png_colors": 128, "jpeg_quality": 78},
+}
+
+RASTER_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
+
+def _shrink_with_sips(data: bytes, ext: str, max_width: int) -> bytes | None:
+    """Pillow 不可用时退回 macOS 自带 sips（仅降采样，不做调色板量化）。"""
+    import shutil
+    import tempfile
+
+    if not shutil.which("sips"):
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "in" + ext)
+        dst = os.path.join(tmp, "out" + ext)
+        with open(src, "wb") as fh:
+            fh.write(data)
+        res = subprocess.run(
+            ["sips", "-Z", str(max_width), src, "--out", dst],
+            capture_output=True,
+        )
+        if res.returncode != 0 or not os.path.exists(dst):
+            return None
+        with open(dst, "rb") as fh:
+            return fh.read()
+
+
+def optimize_images(raw_imgs: dict[str, bytes], opts: dict, stats: dict) -> dict[str, bytes]:
+    """按 max_width / png_colors / jpeg_quality 压缩图片，压不小就保留原图。"""
+    max_width = opts.get("max_width", 0) or 0
+    colors = opts.get("png_colors", 0) or 0
+    quality = opts.get("jpeg_quality", 0) or 0
+    stats.update({"images": 0, "before": 0, "after": 0, "skipped": 0})
+    if not max_width and not colors and not quality:
+        return raw_imgs
+
+    try:
+        import io
+
+        from PIL import Image
+    except ImportError:
+        print("      [提示] 未安装 Pillow，改用 sips 降采样（无法做调色板量化）")
+        Image = None  # type: ignore[assignment]
+
+    out: dict[str, bytes] = {}
+    for path, data in raw_imgs.items():
+        ext = os.path.splitext(path)[1].lower()
+        stats["before"] += len(data)
+        if ext not in RASTER_EXTS:
+            stats["skipped"] += 1
+            out[path] = data
+            stats["after"] += len(data)
+            continue
+        new = None
+        try:
+            if Image is None:
+                if max_width:
+                    new = _shrink_with_sips(data, ext, max_width)
+            else:
+                im = Image.open(io.BytesIO(data))
+                if max_width and im.width > max_width:
+                    height = max(1, round(im.height * max_width / im.width))
+                    im = im.resize((max_width, height), Image.LANCZOS)
+                buf = io.BytesIO()
+                if ext == ".png":
+                    if colors:
+                        if im.mode in ("RGBA", "LA") or (
+                            im.mode == "P" and "transparency" in im.info
+                        ):
+                            # 调色板化会丢 alpha：先合成到白底（CHM 正文为白底）
+                            bg = Image.new("RGB", im.size, (255, 255, 255))
+                            rgba = im.convert("RGBA")
+                            bg.paste(rgba, mask=rgba.split()[-1])
+                            im = bg
+                        else:
+                            im = im.convert("RGB")
+                        im = im.convert("P", palette=Image.ADAPTIVE, colors=colors)
+                    im.save(buf, format="PNG", optimize=True)
+                elif quality:
+                    im.convert("RGB").save(
+                        buf, format="JPEG", quality=quality, optimize=True,
+                        progressive=True,
+                    )
+                else:
+                    im.save(buf, format=im.format or "PNG", optimize=True)
+                new = buf.getvalue()
+        except Exception:
+            new = None
+        if new and len(new) < len(data):
+            stats["images"] += 1
+            out[path] = new
+            stats["after"] += len(new)
+        else:
+            stats["skipped"] += 1
+            out[path] = data
+            stats["after"] += len(data)
+    return out
+
+
+# --------------------------------------------------------------------------
+# HTML 渲染
+# --------------------------------------------------------------------------
+
+CALLOUT_RE = re.compile(
+    r"<blockquote>\s*<p><strong>\s*(Note|Tip|Warning|Caution|Important)\s*:?\s*</strong>\s*:?\s*</p>(.*?)</blockquote>",
+    re.S | re.I,
+)
+CALLOUT_INLINE_RE = re.compile(
+    r"<blockquote>\s*<p><strong>\s*(Note|Tip|Warning|Caution|Important)\s*:?\s*</strong>\s*:?\s*(.*?)</p>(.*?)</blockquote>",
+    re.S | re.I,
+)
+
+
+def render_callouts(html_text: str) -> str:
+    def repl(m: re.Match) -> str:
+        kind = m.group(1).strip().lower()
+        rest = "".join(g for g in m.groups()[1:] if g)
+        return (
+            f'<div class="callout callout-{kind}">'
+            f'<p class="callout-title">{m.group(1).strip().title()}</p>{rest}</div>'
+        )
+
+    html_text = CALLOUT_RE.sub(repl, html_text)
+    html_text = CALLOUT_INLINE_RE.sub(repl, html_text)
+    return html_text
+
+
+def md_to_html(md_text: str) -> str:
+    return markdown.markdown(md_text, extensions=MD_EXTENSIONS, output_format="html")
+
+
+CSS = """
+/* TiDB Docs CHM — 兼容 hh.exe 的 IE 渲染引擎（无 flex / grid / var） */
+body{font-family:"Segoe UI","Microsoft YaHei",Tahoma,Arial,sans-serif;font-size:15px;
+ line-height:1.75;color:#24292f;background:#ffffff;margin:0;padding:0 52px 72px 52px}
+h1{font-size:27px;font-weight:600;color:#0d1117;border-bottom:2px solid #d8dee4;
+ padding-bottom:10px;margin:0 0 22px 0;letter-spacing:-.01em}
+h2{font-size:21px;font-weight:600;color:#0d1117;border-bottom:1px solid #eaeef2;
+ padding-bottom:6px;margin-top:36px}
+h3{font-size:17px;font-weight:600;margin-top:26px}
+h4{font-size:15px;font-weight:600;margin-top:20px;color:#57606a}
+p{margin:12px 0}
+a{color:#0969da;text-decoration:none}
+a:hover{text-decoration:underline}
+ul,ol{padding-left:26px;margin:12px 0}
+li{margin:5px 0}
+code{font-family:Consolas,"Courier New",monospace;background:#f2f4f7;color:#0550ae;
+ padding:2px 5px;font-size:13px}
+pre{background:#f6f8fa;border:1px solid #d8dee4;padding:14px 16px;margin:16px 0;
+ overflow:auto;line-height:1.55}
+pre code{background:none;color:#24292f;padding:0;font-size:13px}
+table{border-collapse:collapse;width:100%;margin:18px 0;font-size:14px}
+th,td{border:1px solid #d8dee4;padding:8px 12px;text-align:left;vertical-align:top}
+th{background:#f6f8fa;font-weight:600;color:#0d1117}
+td{background:#ffffff}
+blockquote{border-left:4px solid #d8dee4;margin:16px 0;padding:2px 16px;color:#57606a}
+.callout{margin:18px 0;padding:12px 16px;border-left:4px solid #0969da;background:#ddf4ff}
+.callout-tip{border-left-color:#1a7f37;background:#dafbe1}
+.callout-warning,.callout-caution{border-left-color:#9a6700;background:#fff8c5}
+.callout-important{border-left-color:#cf222e;background:#ffebe9}
+.callout-title{font-weight:600;margin:0 0 6px 0;color:#0d1117}
+.tab-pane{border:1px solid #d8dee4;border-left:3px solid #8250df;background:#fbfaff;
+ padding:2px 16px 10px 16px;margin:16px 0}
+.tab-label{font-weight:600;color:#8250df;font-size:12px;letter-spacing:.06em;
+ margin:10px 0 2px 0}
+.img-missing{display:block;color:#8c959f;font-size:12px;font-style:italic;
+ border:1px dashed #d0d7de;background:#fbfcfd;padding:6px 10px;margin:14px 0}
+hr{border:0;border-top:1px solid #eaeef2;margin:34px 0}
+.doc-meta{color:#8c959f;font-size:12px;margin:-10px 0 24px 0}
+.doc-footer{margin-top:52px;padding-top:12px;border-top:1px solid #eaeef2;
+ color:#8c959f;font-size:12px}
+/* 封面 */
+.cover{padding-top:8px}
+.cover h1{border-bottom:0;font-size:34px;margin-bottom:6px}
+.cover .sub{color:#57606a;font-size:15px;margin:0 0 6px 0}
+.cover .stat{color:#8c959f;font-size:12px;margin:0 0 30px 0}
+.chapter{margin:0 0 26px 0}
+.chapter h2{margin:0 0 8px 0;padding:0;border-bottom:1px solid #eaeef2;font-size:19px}
+.chapter ul{list-style:none;padding-left:0;margin:0}
+.chapter li{margin:3px 0;font-size:14px}
+.chapter a{color:#0969da}
+"""
+
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="{lang}">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>{title}</title>
+<link rel="stylesheet" type="text/css" href="{css}">
+</head>
+<body>
+{body}
+<div class="doc-footer">TiDB Self-Managed Documentation &middot; 由 pingcap/docs 生成 &middot; {note}</div>
+</body>
+</html>
+"""
+
+
+def wrap_page(title: str, body: str, css: str = "style.css", subtitle: str = "",
+              lang: str = "en", note: str = "已移除视频与图片资源") -> str:
+    meta_line = f'<p class="doc-meta">{html_lib.escape(subtitle)}</p>' if subtitle else ""
+    return PAGE_TEMPLATE.format(
+        lang=lang,
+        title=html_lib.escape(title),
+        css=css,
+        body=meta_line + body,
+        note=note,
+    )
+
+
+# --------------------------------------------------------------------------
+# TOC.md 解析
+# --------------------------------------------------------------------------
+
+TOC_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)[-*+] (?P<content>.+?)\s*$")
+TOC_LINK_RE = re.compile(r"^\[(?P<title>[^\]]*)\]\((?P<url>[^)]+)\)$")
+
+
+def parse_toc_md(text: str) -> list[TocEntry]:
+    roots: list[TocEntry] = []
+    levels: dict[int, TocEntry] = {}
+    for line in text.splitlines():
+        if not line.strip() or line.strip().startswith("<!--"):
+            continue
+        m = TOC_ITEM_RE.match(line)
+        if not m:
+            continue
+        indent = m.group("indent").replace("\t", "  ")
+        level = len(indent) // 2
+        content = m.group("content")
+        lm = TOC_LINK_RE.match(content)
+        if lm:
+            title, url = lm.group("title"), lm.group("url")
+        else:
+            title, url = content, ""
+        entry = TocEntry(title=title.strip(), path=url.lstrip("/"))
+        parent = levels.get(level - 1)
+        if parent is not None:
+            parent.children.append(entry)
+        elif level == 0:
+            roots.append(entry)
+        else:
+            continue
+        for k in [k for k in levels if k >= level]:
+            del levels[k]
+        levels[level] = entry
+    return roots
+
+
+def prune_toc(entries: list[TocEntry], file_set: set[str]) -> list[TocEntry]:
+    """去掉不存在的文档与空分组。"""
+    kept: list[TocEntry] = []
+    for e in entries:
+        children = prune_toc(e.children, file_set)
+        if e.path.endswith(".md"):
+            if e.path in file_set:
+                kept.append(TocEntry(e.title, e.path, children))
+            elif children:
+                kept.append(TocEntry(e.title, "", children))
+        elif children:
+            kept.append(TocEntry(e.title, "", children))
+    return kept
+
+
+def collect_docs(entries: list[TocEntry]) -> list[str]:
+    out: list[str] = []
+    for e in entries:
+        if e.path:
+            out.append(e.path)
+        out.extend(collect_docs(e.children))
+    return out
+
+
+# --------------------------------------------------------------------------
+# 构建
+# --------------------------------------------------------------------------
+
+def build_cover(title: str, entries: list[TocEntry], doc_count: int,
+                note: str = "已移除视频与图片资源") -> str:
+    parts = [f'<div class="cover"><h1>{html_lib.escape(title)}</h1>',
+             '<p class="sub">TiDB Self-Managed 官方文档离线版（CHM）</p>',
+             f'<p class="stat">共 {doc_count} 篇文档 &middot; {note}</p>']
+    for chapter in entries:
+        parts.append('<div class="chapter">')
+        parts.append(f"<h2>{html_lib.escape(chapter.title)}</h2>")
+        parts.append("<ul>")
+        for item in walk_leaf_items(chapter):
+            if item.path:
+                parts.append(
+                    f'<li><a href="{html_lib.escape(item.path[:-3] + ".html")}">'
+                    f"{html_lib.escape(item.title)}</a></li>"
+                )
+        parts.append("</ul></div>")
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
+def build_preview(title: str, entries: list[TocEntry], doc_count: int, chm_name: str) -> str:
+    """模拟 CHM 阅读器窗口的预览页，用于在 macOS 上直观看效果。"""
+    import json
+
+    tree = []
+    for e in entries:
+        tree.append(_toc_to_dict(e))
+    payload = json.dumps(tree, ensure_ascii=False)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>{html_lib.escape(title)} — CHM 效果预览</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;font-family:"Segoe UI","Microsoft YaHei",Tahoma,Arial,sans-serif;
+ background:#e8eaed;color:#24292f}}
+.window{{width:100%;height:100vh;display:table;border:1px solid #b8bec6;background:#fff}}
+.toolbar{{background:#f1f3f5;border-bottom:1px solid #c8ced6;padding:7px 12px;font-size:13px;
+ color:#495057;display:table-caption}}
+.toolbar b{{color:#0d1117}}
+.toolbar .tabs{{float:right}}
+.toolbar .tabs span{{padding:3px 12px;border:1px solid #c8ced6;border-bottom:none;
+ background:#e9ecef;color:#6c757d;font-size:12px}}
+.toolbar .tabs span.on{{background:#fff;color:#0d1117;font-weight:600}}
+.body{{display:table-row;height:100%}}
+.side{{width:302px;border-right:1px solid #c8ced6;background:#fbfcfd;overflow:auto;
+ padding:10px 6px;font-size:13.5px;display:table-cell;vertical-align:top}}
+.side ul{{list-style:none;margin:0;padding-left:15px}}
+.side .grp{{font-weight:600;color:#0d1117;cursor:pointer;padding:3px 4px;
+ border-radius:2px;user-select:none}}
+.side .grp:hover{{background:#eef2f6}}
+.side li{{margin:1px 0}}
+.side a{{color:#1f6feb;text-decoration:none;display:block;padding:3px 4px;border-radius:2px}}
+.side a:hover{{background:#e7f1ff;text-decoration:none}}
+.side a.cur{{background:#1f6feb;color:#fff}}
+.side .arrow{{display:inline-block;width:12px;color:#8c959f;font-size:10px}}
+.main{{display:table-cell;height:100%;vertical-align:top;background:#fff}}
+iframe{{width:100%;height:100%;border:0;background:#fff}}
+</style>
+</head>
+<body>
+<div class="window">
+  <div class="toolbar"><b>{html_lib.escape(title)}</b> &nbsp;·&nbsp; {doc_count} 篇 &nbsp;·&nbsp;
+    {html_lib.escape(chm_name)}
+    <span class="tabs"><span class="on">目录</span><span>索引</span><span>搜索</span></span>
+  </div>
+  <div class="body">
+    <div class="side"><ul id="tree"></ul></div>
+    <div class="main"><iframe id="cv" src="index.html"></iframe></div>
+  </div>
+</div>
+<script>
+var DATA = {payload};
+function build(items, parent, depth) {{
+  items.forEach(function (it) {{
+    var li = document.createElement('li');
+    var url = it.p ? it.p.replace(/\\.md$/, '.html') : '';
+    if (it.c && it.c.length) {{
+      var grp = document.createElement('div');
+      grp.className = 'grp';
+      grp.innerHTML = '<span class="arrow">&#9660;</span>' + it.t;
+      li.appendChild(grp);
+      var ul = document.createElement('ul');
+      build(it.c, ul, depth + 1);
+      li.appendChild(ul);
+      grp.onclick = function () {{
+        var hidden = ul.style.display === 'none';
+        ul.style.display = hidden ? '' : 'none';
+        grp.querySelector('.arrow').innerHTML = hidden ? '&#9660;' : '&#9654;';
+      }};
+    }} else if (url) {{
+      var a = document.createElement('a');
+      a.href = '#'; a.textContent = it.t;
+      a.onclick = function (ev) {{
+        ev.preventDefault();
+        document.getElementById('cv').src = url;
+        var all = document.querySelectorAll('.side a');
+        for (var i = 0; i < all.length; i++) all[i].className = '';
+        a.className = 'cur';
+      }};
+      li.appendChild(a);
+    }} else {{
+      li.textContent = it.t;
+    }}
+    parent.appendChild(li);
+  }});
+}}
+build(DATA, document.getElementById('tree'), 0);
+</script>
+</body>
+</html>
+"""
+
+
+def _toc_to_dict(e: TocEntry) -> dict:
+    return {"t": e.title, "p": e.path, "c": [_toc_to_dict(c) for c in e.children]}
+
+
+def walk_leaf_items(entry: TocEntry) -> list[TocEntry]:
+    out: list[TocEntry] = []
+    if entry.path:
+        out.append(entry)
+    for c in entry.children:
+        out.extend(walk_leaf_items(c))
+    return out
+
+
+def build_hhc(entries: list[TocEntry]) -> str:
+    # 与 HHW 生成的 sitemap 保持一致：不含 charset meta，
+    # 由调用方按本地代码页（简体中文 Windows = GBK）编码
+    lines = [
+        '<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML//EN">',
+        "<HTML>",
+        "<HEAD>",
+        '<meta name="GENERATOR" content="Microsoft HTML Help Workshop 4.1">',
+        "<!-- Sitemap 1.0 -->",
+        "</HEAD>",
+        "<BODY>",
+        "<UL>",
+    ]
+
+    def walk(items: list[TocEntry]) -> None:
+        for it in items:
+            local = it.path[:-3] + ".html" if it.path else ""
+            lines.append("<LI><OBJECT type=\"text/sitemap\">")
+            lines.append(f'<param name="Name" value="{html_lib.escape(it.title, quote=True)}">')
+            if local:
+                lines.append(f'<param name="Local" value="{html_lib.escape(local, quote=True)}">')
+            lines.append("</OBJECT></LI>")
+            if it.children:
+                lines.append("<UL>")
+                walk(it.children)
+                lines.append("</UL>")
+
+    walk(entries)
+    lines.append("</UL></BODY></HTML>")
+    return "\n".join(lines)
+
+
+def build_hhk(entries: list[TocEntry]) -> str:
+    lines = [
+        '<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML//EN">',
+        "<HTML>",
+        "<HEAD>",
+        '<meta name="GENERATOR" content="Microsoft HTML Help Workshop 4.1">',
+        "<!-- Sitemap 1.0 -->",
+        "</HEAD>",
+        "<BODY>",
+        "<UL>",
+    ]
+    for it in collect_entries(entries):
+        if not it.path:
+            continue
+        lines.append("<LI><OBJECT type=\"text/sitemap\">")
+        lines.append(f'<param name="Name" value="{html_lib.escape(it.title, quote=True)}">')
+        lines.append(
+            f'<param name="Local" value="{html_lib.escape(it.path[:-3] + ".html", quote=True)}">'
+        )
+        lines.append("</OBJECT></LI>")
+    lines.append("</UL></BODY></HTML>")
+    return "\n".join(lines)
+
+
+def collect_entries(entries: list[TocEntry]) -> list[TocEntry]:
+    out = []
+    for e in entries:
+        out.append(e)
+        out.extend(collect_entries(e.children))
+    return out
+
+
+def build_hhp(title: str, chm_name: str, files: list[str], lang: str = "en") -> str:
+    # hhp 是 hhc.exe 按 ANSI 读的，Language 行保持纯 ASCII，避免编码问题
+    lang_line = "0x0804 Simplified Chinese" if lang == "zh" else "0x0409 English (United States)"
+    lines = [
+        "[OPTIONS]",
+        "Compatibility=1.1 or later",
+        f"Compiled file={chm_name}",
+        "Contents file=toc.hhc",
+        "Index file=index.hhk",
+        "Default topic=index.html",
+        f"Title={title}",
+        f"Language={lang_line}",
+        "Binary TOC=Yes",
+        "Binary Index=Yes",
+        "Full-text search=Yes",
+        "Create CHI file=No",
+        "Display compile progress=No",
+        "",
+        "[FILES]",
+    ]
+    lines.extend(files)
+    lines.extend(["", "[INFOTYPES]", ""])
+    return "\n".join(lines)
+
+
+def to_chm_toc(entries: list[TocEntry]) -> list[TocNode]:
+    nodes: list[TocNode] = []
+    for e in entries:
+        node = TocNode(title=e.title, local=(e.path[:-3] + ".html") if e.path else "")
+        for c in e.children:
+            node.children.extend(to_chm_toc([c]))
+        nodes.append(node)
+    return nodes
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo", required=True, help="pingcap/docs 的 git 仓库路径")
+    ap.add_argument("--out", required=True, help="输出目录")
+    ap.add_argument("--title", default="TiDB Documentation")
+    ap.add_argument("--chm", default="tidb-docs.chm")
+    ap.add_argument("--sections", default="", help="逗号分隔的顶层章节名，留空取前 3 个")
+    ap.add_argument("--limit", type=int, default=0, help="最多收录多少篇文档，0 表示不限")
+    ap.add_argument("--images", "--keep-images", dest="images", action="store_true",
+                    help="包含文档引用的图片资源（默认不包含，体积最小）")
+    ap.add_argument("--image-profile", default="original",
+                    choices=sorted(IMAGE_PROFILES),
+                    help="图片压缩档位：original=原图（默认）；"
+                         "compact=宽≤1200 + PNG 256 色；tiny=宽≤1000 + PNG 128 色")
+    ap.add_argument("--image-max-width", type=int, default=-1,
+                    help="覆盖档位的最大宽度（像素，0=不缩放）")
+    ap.add_argument("--image-colors", type=int, default=-1,
+                    help="覆盖档位的 PNG 调色板色数（0=保持真彩）")
+    ap.add_argument("--image-jpeg-quality", type=int, default=-1,
+                    help="覆盖档位的 JPEG 质量（0=不重编码）")
+    ap.add_argument("--ref", default="",
+                    help="TiDB 版本分支，如 release-8.5 / release-7.1（默认 master 最新）")
+    ap.add_argument("--toc-mode", default="hhc", choices=["hhc", "binary"],
+                    help="目录形态：hhc=仅嵌套目录源，侧栏最干净（默认，推荐）；"
+                         "binary=二进制 #TOCIDX（Windows hh.exe 原生，"
+                         "但部分第三方阅读器会把全部条目平铺）")
+    ap.add_argument("--all", action="store_true", help="收录 TOC.md 中的全部章节")
+    ap.add_argument("--lang", default="zh", choices=["zh", "en"],
+                    help="zh: 中文文档（GBK 目录 + 0x0804），en: 英文")
+    ap.add_argument("--utf8-bom", dest="utf8_bom", action="store_true", default=True,
+                    help="正文 HTML/CSS 写入 UTF-8 BOM（默认开启，"
+                         "让阅读器按 UTF-8 解码，打开即不乱码）")
+    ap.add_argument("--no-utf8-bom", dest="utf8_bom", action="store_false",
+                    help="关闭 BOM（正文改为仅靠 <meta charset> 声明编码）")
+    args = ap.parse_args()
+
+    repo = os.path.abspath(args.repo)
+    out = os.path.abspath(args.out)
+    os.makedirs(out, exist_ok=True)
+
+    if args.ref:
+        print(f"[0/6] 切换到版本分支 {args.ref}")
+        subprocess.run(
+            ["git", "-C", repo, "fetch", "--depth", "1", "origin", args.ref],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", repo, "checkout", "--force", "FETCH_HEAD"],
+            check=True, capture_output=True,
+        )
+
+    print(f"[1/6] 解析 TOC.md  仓库={repo}")
+    toc_text = git_read(repo, "TOC.md")
+    if not toc_text:
+        print("无法读取 TOC.md", file=sys.stderr)
+        return 1
+    entries = parse_toc_md(toc_text)
+    if args.all:
+        pass
+    elif args.sections:
+        wanted = [s.strip() for s in args.sections.split(",") if s.strip()]
+        entries = [e for e in entries if e.title in wanted]
+    else:
+        entries = entries[:3]
+    file_set = git_file_set(repo)
+    entries = prune_toc(entries, file_set)
+    if not entries:
+        print("没有匹配到任何章节", file=sys.stderr)
+        return 1
+
+    doc_paths: list[str] = []
+    for p in collect_docs(entries):
+        if p not in doc_paths:
+            doc_paths.append(p)
+    if args.limit:
+        doc_paths = doc_paths[: args.limit]
+        allowed = set(doc_paths)
+        entries = prune_entries(entries, allowed)
+    print(f"      章节 {len(entries)} 个，文档 {len(doc_paths)} 篇")
+
+    print("[2/6] 转换 Markdown -> HTML")
+    stats = {"videos": 0, "images": 0, "image_paths": []}
+    media_note = ("含图片资源（{} 档）".format(args.image_profile) if args.images
+                  else "已移除视频与图片资源")
+    pages: dict[str, bytes] = {}
+    raw_map = git_read_many(repo, doc_paths)
+    for idx, path in enumerate(doc_paths, 1):
+        raw = raw_map.get(path)
+        if raw is None:
+            continue
+        if idx % 200 == 0:
+            print(f"      {idx}/{len(doc_paths)}")
+        meta, body = clean_markdown(raw, args.images, stats)
+        html_body = render_callouts(md_to_html(body))
+        title = meta.get("title") or os.path.basename(path)[:-3].replace("-", " ").title()
+        summary = meta.get("summary", "")
+        page = wrap_page(title, html_body, subtitle=summary, lang=args.lang,
+                         note=media_note)
+        pages[path[:-3] + ".html"] = page.encode("utf-8")
+    print(f"      移除视频嵌入 {stats['videos']} 处，省略图片 {stats['images']} 张")
+
+    if args.images:
+        img_paths = sorted(set(stats["image_paths"]))
+        print(f"      打包引用图片 {len(img_paths)} 张（首建需按需下载，可能较慢）")
+        raw_imgs = git_read_many_raw(repo, img_paths)
+        got = len(raw_imgs)
+        profile = IMAGE_PROFILES[args.image_profile]
+        img_opts = {
+            "max_width": args.image_max_width if args.image_max_width >= 0
+            else profile["max_width"],
+            "png_colors": args.image_colors if args.image_colors >= 0
+            else profile["png_colors"],
+            "jpeg_quality": args.image_jpeg_quality if args.image_jpeg_quality >= 0
+            else profile["jpeg_quality"],
+        }
+        img_stats: dict = {}
+        raw_imgs = optimize_images(raw_imgs, img_opts, img_stats)
+        for p, data in raw_imgs.items():
+            pages[p] = data
+        print(f"      图片入库 {got}/{len(img_paths)}")
+        if img_stats["images"] or img_stats["before"]:
+            before = img_stats["before"] / 1048576
+            after = img_stats["after"] / 1048576
+            ratio = (after / before * 100) if before else 100
+            print(f"      图片压缩档 {args.image_profile}"
+                  f"（宽≤{img_opts['max_width'] or '原图'}、"
+                  f"PNG {img_opts['png_colors'] or '真彩'} 色、"
+                  f"JPEG q{img_opts['jpeg_quality'] or '-'}）："
+                  f"{before:.1f} MB -> {after:.1f} MB（{ratio:.0f}%，"
+                  f"压缩 {img_stats['images']} 张、保留原图 {img_stats['skipped']} 张）")
+
+    print("[3/6] 生成封面与资源")
+    doc_count = sum(1 for k in pages if k.endswith(".html"))
+    cover = build_cover(args.title, entries, doc_count, note=media_note)
+    pages["index.html"] = wrap_page(args.title, cover, note=media_note).encode("utf-8")
+    pages["style.css"] = CSS.encode("utf-8")
+    pages["preview.html"] = build_preview(
+        args.title, entries, len(pages), args.chm
+    ).encode("utf-8")
+
+    if args.utf8_bom:
+        for name in list(pages):
+            if name.endswith((".html", ".css")) and not pages[name].startswith(UTF8_BOM):
+                pages[name] = UTF8_BOM + pages[name]
+
+    print("[4/6] 生成 hhp / hhc / hhk（供 Windows hhc.exe 使用）")
+    # hhc/hhk 由 hh.exe 与 hhc.exe 按 ANSI 代码页解析，中文环境必须 GBK。
+    # index.hhk 不打进 CHM——部分阅读器会把索引条目平铺追加在目录树末尾
+    # （表现为"术语表下面一大串多余条目"），只保留在磁盘供 hhc.exe 使用。
+    pages["toc.hhc"] = build_hhc(entries).encode("gbk")
+    pages["index.hhk"] = build_hhk(entries).encode("gbk")
+    file_list = sorted(pages)
+    skip_in_chm = {"preview.html", "index.hhk"}
+    with open(os.path.join(out, "toc.hhc"), "wb") as fh:
+        fh.write(pages["toc.hhc"])
+    with open(os.path.join(out, "index.hhk"), "wb") as fh:
+        fh.write(pages["index.hhk"])
+    with open(os.path.join(out, "docs.hhp"), "wb") as fh:
+        fh.write(
+            build_hhp(args.title, args.chm,
+                      [f for f in file_list if f not in skip_in_chm], args.lang)
+            .encode("gbk")
+        )
+    for name, data in pages.items():
+        target = os.path.join(out, name)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as fh:
+            fh.write(data)
+
+    print("[5/6] 打包 CHM")
+    writer = ChmWriter(
+        title=args.title,
+        default_page="index.html",
+        language_id=0x0804 if args.lang == "zh" else 0x0409,
+        toc_name="toc.hhc",
+        index_name="",  # 不声明索引：避免阅读器把索引条目平铺进目录树
+        include_binary_toc=(args.toc_mode == "binary"),
+    )
+    for name in file_list:
+        if name in skip_in_chm:
+            continue
+        writer.add_file(name, pages[name])
+    for node in to_chm_toc(entries):
+        writer.add_toc(node)
+    chm_path = os.path.join(out, args.chm)
+    writer.write(chm_path)
+
+    print("[6/6] 校验")
+    from chmwriter import ChmReader
+
+    reader = ChmReader(chm_path)
+    expect = {"/" + n for n in file_list if n not in skip_in_chm} | {"/#SYSTEM"}
+    if args.toc_mode == "binary":
+        expect |= {"/#TOCIDX", "/#TOPICS", "/#STRINGS"}
+    missing = sorted(expect - set(reader.files))
+    ok_toc = True
+    if args.toc_mode == "binary":
+        ok_toc = reader.read("/#TOCIDX")[:4] == struct_pack_blocksize()
+        print(f"      #TOCIDX 头部校验 {'OK' if ok_toc else '失败'}")
+    sample = reader.read("/index.html")
+    print(f"      文件条目 {len(reader.files)} 个，缺失 {len(missing)} 个")
+    if missing:
+        print("      缺失：", missing[:10])
+    print(f"      index.html 回读 {len(sample)} 字节")
+
+    # 目录卫生检查：侧栏目录只允许来自 toc.hhc。
+    # 索引文件（*.hhk）与二进制目录树会被第三方阅读器合并进目录面板，
+    # 表现为"术语表下面一长串平铺条目"，必须保证不被打进 CHM。
+    leaked_index = sorted(
+        n for n in reader.files
+        if n.lower().endswith(".hhk") or n.startswith("/#IDXHDR")
+        or n.startswith("/#IVB") or n.startswith("/#INDEX")
+    )
+    binary_entries = sorted(
+        n for n in reader.files
+        if n in {"/#TOCIDX", "/#TOPICS", "/#STRINGS", "/#URLTBL", "/#URLSTR"}
+    )
+    hygiene_ok = True
+    if leaked_index:
+        hygiene_ok = False
+        print(f"      [失败] CHM 内混入索引文件：{leaked_index}")
+    if binary_entries and args.toc_mode != "binary":
+        hygiene_ok = False
+        print(f"      [失败] CHM 内混入二进制目录树：{binary_entries}")
+    if hygiene_ok:
+        toc_source = "二进制 #TOCIDX" if args.toc_mode == "binary" else "/toc.hhc"
+        print(f"      目录卫生检查 OK：侧栏目录来源仅 {toc_source}，"
+              f"无 *.hhk 索引与额外汇总条目")
+
+    total_html = sum(len(v) for v in pages.values())
+    chm_size = os.path.getsize(chm_path)
+    print()
+    print("构建完成")
+    print(f"  HTML 总计 : {total_html / 1024:.1f} KB（{len(pages)} 个文件）")
+    print(f"  CHM 大小  : {chm_size / 1024:.1f} KB  -> {chm_path}")
+    print(f"  HHP 工程  : {os.path.join(out, 'docs.hhp')}（Windows: hhc.exe docs.hhp）")
+    return 0 if hygiene_ok else 1
+
+
+def struct_pack_blocksize() -> bytes:
+    import struct
+
+    return struct.pack("<I", 0x1000)
+
+
+def prune_entries(entries: list[TocEntry], allowed: set[str]) -> list[TocEntry]:
+    out: list[TocEntry] = []
+    for e in entries:
+        children = prune_entries(e.children, allowed)
+        if e.path in allowed:
+            out.append(TocEntry(e.title, e.path, children))
+        elif children:
+            out.append(TocEntry(e.title, "", children))
+    return out
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

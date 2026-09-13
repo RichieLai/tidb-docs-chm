@@ -1,0 +1,13 @@
+# 构建产物（./build.sh 可完整重建，不入库）
+dist/
+
+# 文档源仓库（脚本自动 git clone 到 repos/docs-cn）
+repos/
+
+# Python 虚拟环境与字节码
+.venv/
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
