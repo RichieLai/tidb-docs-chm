@@ -5,10 +5,11 @@ DIST := dist
 CHM        := $(DIST)/tidb-docs-cn/tidb-docs-cn.chm
 CHM_IMAGES := $(DIST)/tidb-docs-cn-images/tidb-docs-cn-images.chm
 
-.PHONY: help build images test verify preview clean
+.PHONY: help build plain images test verify preview clean
 
 help:
-	@echo "make build          无图版 CHM  -> $(CHM)"
+	@echo "make build          纯文字版 + 压缩图片版"
+	@echo "make plain          只生成纯文字版 -> $(CHM)"
 	@echo "make images         含图片版 CHM（compact 档）-> $(CHM_IMAGES)"
 	@echo "make test           渲染回归测试（代码块嵌套 + 全量文档扫描）"
 	@echo "make verify         自检两个 CHM（目录卫生 / 编码）"
@@ -17,6 +18,9 @@ help:
 
 build:
 	./build.sh
+
+plain:
+	./build.sh --no-images
 
 images:
 	./build.sh --images

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-verify_chm.py —— 检查 CHM 侧栏目录是否"干净"。
+verify_chm.py —— 检查 CHM 的直接打开、离线资源、目录与版式规则。
 
 背景：第三方阅读器（macOS 上的"CHM 阅读器-畅享版"、CHM Reader - Enjoy 等）
 除目录树外，还会把 CHM 内的**索引文件**（``*.hhk`` / ``#IDXHDR``）和
@@ -11,21 +11,26 @@ verify_chm.py —— 检查 CHM 侧栏目录是否"干净"。
   2. 是否混入索引文件（会污染侧栏）
   3. 目录树统计：顶层章节数、节点总数、最大层级
   4. 目录指向的 HTML 是否都在 CHM 内
+  5. 主题与图片是否使用短 ASCII 哈希文件名
+  6. 是否残留网页模板、页首导航、远程显示资源或本地断链
+  7. 有序列表是否明确写入层级类型
 
 用法：
     python3 tools/verify_chm.py dist/tidb-docs-cn/tidb-docs-cn.chm
 
-退出码：0 = 干净；1 = 存在索引泄漏或目录缺失。
+退出码：0 = 全部通过；1 = 存在兼容性、离线资源、目录或版式问题。
 """
 
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -35,7 +40,15 @@ TOKEN_RE = re.compile(r"<UL>|</UL>|<LI>", re.I)
 LOCAL_RE = re.compile(r'name="Local"\s+value="([^"]*)"', re.I)
 INDEX_MARKERS = ("#IDXHDR", "#IVB", "#INDEX")
 BINARY_TOC = ("/#TOCIDX", "/#TOPICS", "/#STRINGS", "/#URLTBL", "/#URLSTR")
+FULLTEXT_MARKERS = ("/$FIfti", "/#FIfti")
 UTF8_BOM = b"\xef\xbb\xbf"
+TOPIC_NAME_RE = re.compile(r"^/p[0-9a-f]{16}\.html$")
+ASSET_NAME_RE = re.compile(r"^/m[0-9a-f]{16}\.[a-z0-9]+$")
+ATTR_RE = re.compile(r'\b(?:href|src)\s*=\s*["\']([^"\']+)["\']', re.I)
+REMOTE_ASSET_RE = re.compile(
+    r'<(?:img|script|iframe|video|source)\b[^>]*\bsrc\s*=\s*["\']https?://|'
+    r'<link\b[^>]*\bhref\s*=\s*["\']https?://', re.I
+)
 
 
 def looks_like_text(data: bytes) -> bool:
@@ -95,6 +108,7 @@ def main() -> int:
 
     index_files = [n for n in names if n.lower().endswith(".hhk")]
     index_files += [n for n in names if any(n.startswith(m) for m in INDEX_MARKERS)]
+    fulltext_files = [n for n in names if any(n.startswith(m) for m in FULLTEXT_MARKERS)]
     binary = [n for n in names if n in BINARY_TOC]
     hhc = [n for n in names if n.lower().endswith(".hhc")]
 
@@ -105,11 +119,15 @@ def main() -> int:
     print(f"目录源    : {', '.join(hhc) if hhc else '（无 .hhc）'}"
           + ("，另有二进制目录树" if binary else ""))
     print(f"索引文件  : {', '.join(index_files) if index_files else '无'}")
+    print(f"全文数据库: {', '.join(fulltext_files) if fulltext_files else '无'}")
 
     ok = True
     if index_files:
         ok = False
         print("  [失败] 索引文件会被阅读器平铺追加到目录树末尾，必须从 CHM 中移除")
+    if fulltext_files:
+        ok = False
+        print("  [失败] 直接打开兼容版不应包含全文搜索数据库")
     if binary and not hhc:
         print("  [提示] 只有二进制目录树：部分第三方阅读器会把整棵树平铺成一级列表")
     if binary and hhc:
@@ -136,11 +154,90 @@ def main() -> int:
         if html_files and len(bom) < len(html_files):
             print("  [提示] 缺 BOM 的页面会被阅读器按系统 ANSI 解码（中文乱码），"
                   "建议重新构建时保持 --utf8-bom（默认开启）")
+
+        topic_names = [n for n in html_files if n not in ("/index.html", "/license.html")]
+        bad_topic_names = [n for n in topic_names if not TOPIC_NAME_RE.match(n)]
+        print(f"主题文件名: {len(topic_names) - len(bad_topic_names)}/{len(topic_names)} 个为短 ASCII 哈希名")
+        if bad_topic_names:
+            ok = False
+            print("  [失败] 非兼容主题文件名：", bad_topic_names[:5])
+
+        media_exts = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".bmp", ".tif", ".tiff")
+        media_files = [n for n in names if n.lower().endswith(media_exts)]
+        bad_media_names = [n for n in media_files if not ASSET_NAME_RE.match(n)]
+        print(f"图片文件名: {len(media_files) - len(bad_media_names)}/{len(media_files)} 个为短 ASCII 哈希名")
+        if bad_media_names:
+            ok = False
+            print("  [失败] 非兼容图片文件名：", bad_media_names[:5])
+
+        shortcode_pages = []
+        nav_pages = []
+        remote_asset_pages = []
+        ordered_total = ordered_typed = image_tags = 0
+        missing_refs: set[str] = set()
+        missing_anchors: set[str] = set()
+        content_names = set(names)
+        html_texts = {
+            name: read_bytes(name).decode("utf-8-sig", "replace")
+            for name in html_files
+        }
+        anchors = {
+            name: set(re.findall(r'\b(?:id|name)=["\']([^"\']+)["\']', text, re.I))
+            for name, text in html_texts.items()
+        }
+        for name in html_files:
+            text = html_texts[name]
+            if re.search(r"\{\{<\s*/?copyable\b", text, re.I):
+                shortcode_pages.append(name)
+            if re.search(r'class=["\'][^"\']*\b(?:nav|toc)\b[^"\']*["\']', text, re.I):
+                nav_pages.append(name)
+            if REMOTE_ASSET_RE.search(text):
+                remote_asset_pages.append(name)
+            ordered_total += len(re.findall(r"<ol\b", text, re.I))
+            ordered_typed += len(re.findall(r'<ol\b[^>]*\btype=["\'][1ai]["\']', text, re.I))
+            image_tags += len(re.findall(r"<img\b", text, re.I))
+            for raw_ref in ATTR_RE.findall(text):
+                raw_ref = unquote(raw_ref)
+                if (not raw_ref or raw_ref.startswith("//")
+                        or re.match(r"^[a-z][a-z0-9+.-]*:", raw_ref, re.I)):
+                    continue
+                ref, _, fragment = raw_ref.partition("#")
+                ref = ref.split("?", 1)[0]
+                if not ref:
+                    target = name
+                else:
+                    target = "/" + posixpath.normpath(
+                        posixpath.join(posixpath.dirname(name.lstrip("/")), ref.lstrip("/"))
+                    ).lstrip("/")
+                if target not in content_names:
+                    missing_refs.add(f"{name} -> {target}")
+                elif fragment and target in anchors and fragment not in anchors[target]:
+                    missing_anchors.add(f"{name} -> {target}#{fragment}")
+        print(f"正文清理  : 模板残留 {len(shortcode_pages)} 页，页首导航 {len(nav_pages)} 页，"
+              f"远程显示资源 {len(remote_asset_pages)} 页")
+        print(f"列表层级  : {ordered_typed}/{ordered_total} 个有序列表带明确类型")
+        print(f"离线资源  : 图片标签 {image_tags} 个，本地引用缺失 {len(missing_refs)} 个，"
+              f"锚点缺失 {len(missing_anchors)} 个")
+        if (shortcode_pages or nav_pages or remote_asset_pages
+                or ordered_typed != ordered_total or missing_refs or missing_anchors):
+            ok = False
+            if shortcode_pages:
+                print("  [失败] 模板标记残留：", shortcode_pages[:5])
+            if nav_pages:
+                print("  [失败] 文章含重复页首导航：", nav_pages[:5])
+            if remote_asset_pages:
+                print("  [失败] 页面显示依赖网络资源：", remote_asset_pages[:5])
+            if ordered_typed != ordered_total:
+                print("  [失败] 有序列表未全部写入层级类型")
+            if missing_refs:
+                print("  [失败] 本地链接或资源缺失：", sorted(missing_refs)[:5])
+            if missing_anchors:
+                print("  [失败] 本地锚点缺失：", sorted(missing_anchors)[:5])
     else:
         print("正文编码  : 跳过（压缩内容未解包）")
 
-    print("结论      : " + ("侧栏目录干净（仅一棵目录树，无索引泄漏）" if ok
-                            else "侧栏目录存在污染或缺失，见上方 [失败] 项"))
+    print("结论      : " + ("直接打开、离线资源、目录与版式规则全部通过" if ok
+                            else "存在兼容性、离线资源、目录或版式问题，见上方 [失败] 项"))
     return 0 if ok else 1
 
 

@@ -9,11 +9,11 @@
 #   ./build.sh --no-images    # 只出无图版
 #   ./build.sh --images --image-profile original   # 含图片但保留原图
 #   ./build.sh --keep-html    # 额外保留 HTML 版与 hhc/hhp 工程文件
-#   ./build.sh --no-compress  # 不用 chmcmd 的 LZX 压缩（改用内置打包器）
+#   ./build.sh --no-compress  # 仅调试：改用未压缩的内置打包器
 #
 # 产物默认只保留 CHM；HTML/工程文件是打包用中间产物，构建成功后自动清理。
 # 含图片版默认同时做两层压缩：图片 compact 档（宽≤1200 + PNG 256 色）+ CHM LZX。
-# CHM 默认用 FPC 的 chmcmd 做 LZX 压缩（体积约 1/3），没装 chmcmd 时自动退回内置打包器。
+# 默认必须用 FPC 的 chmcmd，生成已经过 Windows hh.exe 验证的直接打开兼容结构。
 # 幂等可重复执行：venv、源码仓库、产物均自动准备/更新。
 set -euo pipefail
 
@@ -95,6 +95,12 @@ if [ "$BUILD_MODE" != "plain" ] && ! "$PY" -c "import PIL" 2>/dev/null; then
     "$VENV/bin/pip" install --quiet pillow
 fi
 
+if { [ "$COMPILER" = "auto" ] || [ "$COMPILER" = "chmcmd" ]; } && ! command -v chmcmd >/dev/null 2>&1; then
+    echo "缺少 chmcmd。请先安装 Free Pascal（macOS: brew install fpc），" >&2
+    echo "再重新运行 ./build.sh。--no-compress 仅用于开发调试。" >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------- 2. 源仓库
 if [ ! -d "$REPO/.git" ]; then
     log "克隆文档仓库（体积过滤，只取 Markdown）"
@@ -127,7 +133,8 @@ build_target() {
     log "构建 CHM: ${title}"
     mkdir -p "$out"
     local args=(--repo "$REPO" --out "$out" --title "$title" --chm "$chm"
-                --prune "$PRUNE" --compiler "$COMPILER" --all --lang zh)
+                --prune "$PRUNE" --compiler "$COMPILER" --all --lang zh
+                --source-ref "$REF")
     if [ "$images" = 1 ]; then
         args+=(--images)
         if [ "${#IMAGE_ARGS[@]}" -gt 0 ]; then

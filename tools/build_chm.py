@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-build_chm.py —— 把 pingcap/docs 的 Markdown 文档打包成 CHM。
+build_chm.py —— 把 pingcap/docs-cn 的 Markdown 文档打包成 CHM。
 
 设计目标：
   1. 体积小：默认剔除 media 图片与全部视频嵌入，去掉 Hugo 短代码与站内冗余脚本
   2. 无视频：删除 <iframe> / <video> / YouTube、Bilibili 等嵌入及其引导句
   3. 优雅：统一 CSS（按 hh.exe 的 IE 渲染引擎能力编写，不使用 flex/grid/var）
-  4. 可复现：同时输出 .hhp/.hhc/.hhk + HTML，可在 Windows 上用官方 hhc.exe 重新编译
+  4. 可复现：输出最小 .hhp/.hhc + HTML，可在 Windows 上重新编译
+  5. 兼容：短 ASCII 内容名、单一传统目录、无自定义窗口/索引/全文库
 
 用法：
     python3 build_chm.py --repo ../src/docs --out ../out --sections "Get Started,Deploy"
@@ -15,6 +16,7 @@ build_chm.py —— 把 pingcap/docs 的 Markdown 文档打包成 CHM。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html as html_lib
 import json
 import os
@@ -142,6 +144,7 @@ VIDEO_LEAD_RE = re.compile(
     re.M | re.I,
 )
 SHORTCODE_RE = re.compile(r"\{\{<.*?>\}\}", re.S)
+MARKDOWN_TOC_RE = re.compile(r"^\s*\[TOC\]\s*$", re.M | re.I)
 # Hugo 变量：{{{ .company }}} / {{{.tidb-operator-version}}}，取值见仓库 variables.json
 # （只处理三花括号形式；`{{fn .Table}}`、`{{ColumnName}}` 等出现在代码/模板示例里，必须原样保留）
 TEMPLATE_VAR_RE = re.compile(r"\{\{\{\s*\.([A-Za-z0-9_-]+)\s*\}\}\}")
@@ -150,16 +153,43 @@ DIV_LABEL_RE = re.compile(r'<div\s+[^>]*?\blabel="([^"]*)"[^>]*>', re.I)
 DETAILS_RE = re.compile(r"<details(\s+markdown=\"1\")?>", re.I)
 IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 # 链接文字里允许出现 [ ]（如 [`BATCH [ON COLUMN] LIMIT INTEGER DELETE`](/x.md)）
-MD_LINK_RE = re.compile(r"\[((?:[^\[\]]|\[[^\]]*\])*)\]\((/[^)\s]+\.md)(#[^)\s]*)?\)")
+MD_LINK_RE = re.compile(
+    r"(?<!!)\[((?:[^\[\]\n]|\[[^\]\n]*\])*)\]\((/[^)\s]+\.md)(#[^)\s]*)?\)"
+)
 # 指向 /media/... 的普通链接（少数文档用它代替图片语法）
-MEDIA_LINK_RE = re.compile(r"\[((?:[^\[\]]|\[[^\]]*\])*)\]\((/media/[^)\s]+)\)")
+MEDIA_LINK_RE = re.compile(
+    r"(?<!!)\[((?:[^\[\]\n]|\[[^\]\n]*\])*)\]\((/media/[^)\s]+)\)"
+)
 # 官网 TiDB 自管理文档链接：命中仓库内文档就改成本地页面，其它站点保持外链
 PINGCAP_DOC_RE = re.compile(
     r"https?://docs\.pingcap\.com/(?:zh/)?tidb/"
-    r"(?:stable|dev|v\d+\.\d+(?:\.\d+)?)/([^)#?\s]+)"
-    r"(#[^)\s\"'<>]*)?",
+    r"(?P<version>stable|dev|v\d+\.\d+(?:\.\d+)?)/"
+    r"(?P<path>[^)#?\s]+)(?P<anchor>#[^)\s\"'<>]*)?",
     re.I,
 )
+
+
+def html_name_for_doc(path: str) -> str:
+    """Return a short ASCII-only topic name for reliable Windows CHM URLs."""
+    normalized = path.lstrip("/").replace("\\", "/")
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"p{digest}.html"
+
+
+def local_asset_name(path: str) -> str:
+    """Return a short ASCII-only name while retaining the media extension."""
+    normalized = path.lstrip("/").replace("\\", "/")
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+    ext = os.path.splitext(normalized)[1].lower()
+    return f"m{digest}{ext}"
+
+
+def normalize_anchor(anchor: str) -> str:
+    """Keep one URL fragment; malformed source links sometimes repeat it."""
+    if not anchor:
+        return ""
+    fragment = anchor.lstrip("#").split("#", 1)[0]
+    return f"#{fragment}" if fragment else ""
 
 
 def split_frontmatter(text: str) -> tuple[dict, str]:
@@ -300,10 +330,11 @@ def rewrite_links(text: str, keep_images: bool, stats: dict,
     - 图片按策略保留或省略
     """
     def link_sub(m: re.Match) -> str:
-        label, target, anchor = m.group(1), m.group(2), m.group(3) or ""
+        label, target = m.group(1), m.group(2)
+        anchor = normalize_anchor(m.group(3) or "")
         path = target.lstrip("/")
         if included is None or path in included:
-            return f"[{label}]({target[:-3]}.html{anchor})"
+            return f"[{label}]({html_name_for_doc(path)}{anchor})"
         # 该页面没有打进 CHM：改指官网，避免留下点不开的站内链接
         slug = os.path.basename(path)[:-3]
         stats["md_external"] += 1
@@ -316,7 +347,7 @@ def rewrite_links(text: str, keep_images: bool, stats: dict,
         label, url = m.group(1), m.group(2)
         if keep_images:
             stats["image_paths"].append(url.lstrip("/"))
-            return m.group(0)
+            return f"[{label}]({local_asset_name(url)})"
         stats["media_links"] += 1
         return label
 
@@ -325,16 +356,25 @@ def rewrite_links(text: str, keep_images: bool, stats: dict,
     # 官网链接指向的文档如果就在本 CHM 里，改成本地页面；否则（Cloud、K8s、
     # GitHub 等本 CHM 没有的内容）原样保留外链。
     if link_index:
+        current_match = re.search(r"/(stable|dev|v\d+\.\d+(?:\.\d+)?)/?$", web_prefix, re.I)
+        current_version = current_match.group(1).lower() if current_match else ""
+
         def doc_sub(m: re.Match) -> str:
+            target_version = m.group("version").lower()
+            # Explicit links to another documentation version can refer to pages or
+            # headings absent from this build. Keep those links on the website.
+            if not current_version or target_version != current_version:
+                stats["ext_kept"] += 1
+                return m.group(0)
             # URL 里可能是嵌套路径（如 v8.5/tiproxy/tiproxy-overview/），取末段做 slug
-            slug = m.group(1).rstrip("/").split("/")[-1]
-            anchor = m.group(2) or ""
+            slug = m.group("path").rstrip("/").split("/")[-1]
+            anchor = normalize_anchor(m.group("anchor") or "")
             path = link_index.get(slug)
             if not path:
                 stats["ext_kept"] += 1
                 return m.group(0)
             stats["ext_localized"] += 1
-            return f"/{path[:-3]}.html{anchor}"
+            return f"{html_name_for_doc(path)}{anchor}"
 
         text = PINGCAP_DOC_RE.sub(doc_sub, text)
 
@@ -342,7 +382,7 @@ def rewrite_links(text: str, keep_images: bool, stats: dict,
         alt, url = m.group(1), m.group(2)
         if keep_images:
             stats["image_paths"].append(url.lstrip("/"))
-            return f"![{alt}]({url})"
+            return f"![{alt}]({local_asset_name(url)})"
         stats["images"] += 1
         label = html_lib.escape(alt or "illustration")
         return f'<p class="img-missing">[图片已省略] {label}</p>'
@@ -359,6 +399,7 @@ def normalize_blocks(text: str) -> str:
     原样输出成一坨（``` 和 > 直接显示在正文里）。
     """
     text = SHORTCODE_RE.sub("", text)
+    text = MARKDOWN_TOC_RE.sub("", text)
     text = SIMPLETAB_RE.sub("", text)
     text = DIV_LABEL_RE.sub(
         lambda m: '<div class="tab-pane" markdown="1">'
@@ -556,13 +597,40 @@ def restore_code_blocks(html_text: str, code_blocks: list[str]) -> str:
 
 
 def md_to_html(md_text: str, code_blocks: list[str] | None = None) -> str:
-    html_text = markdown.markdown(md_text, extensions=MD_EXTENSIONS, output_format="html")
+    html_text = markdown.markdown(
+        md_text,
+        extensions=MD_EXTENSIONS,
+        extension_configs={"toc": {"slugify": docs_heading_slug}},
+        output_format="html",
+    )
     if code_blocks:
         html_text = restore_code_blocks(html_text, code_blocks)
     return html_text
 
 
+def docs_heading_slug(value: str, separator: str) -> str:
+    """Match the Unicode heading anchors used by docs.pingcap.com.
+
+    Punctuation is removed, Unicode letters and underscores are kept, and each
+    whitespace character becomes a hyphen. Keeping consecutive/trailing
+    hyphens is required for anchors such as optimizer hint signatures.
+    """
+    # Python-Markdown passes only the heading's text here (inline markup is
+    # already removed), so angle-bracketed parameters are content, not tags.
+    value = html_lib.unescape(value).lower()
+    value = re.sub(r"[^\w\s-]", "", value, flags=re.UNICODE)
+    return re.sub(r"\s", separator, value)
+
+
 BLOCK_IN_P_RE = re.compile(r"<p>\s*(<pre>.*?</pre>)\s*</p>", re.S | re.I)
+NAV_BLOCK_RE = re.compile(
+    r'<div\s+class="(?:toc|nav)"[^>]*>.*?</div>', re.S | re.I
+)
+ORDERED_LIST_TAG_RE = re.compile(r"<ol\b[^>]*>|</ol\s*>", re.I)
+TABLE_RE = re.compile(r"(?<!<div class=\"tablewrap\">)(<table\b.*?</table>)", re.S | re.I)
+HEADING_DUPLICATE_ID_RE = re.compile(
+    r'(<h[1-6]\b[^>]*\bid=["\'])([^"\']+?)_(\d+)(["\'])', re.I
+)
 
 
 def unwrap_block_in_p(html_text: str) -> str:
@@ -570,46 +638,84 @@ def unwrap_block_in_p(html_text: str) -> str:
     return BLOCK_IN_P_RE.sub(r"\1", html_text)
 
 
+def apply_ordered_list_types(html_text: str) -> str:
+    """Use decimal/alpha/roman markers by nesting depth, preserving ``start``."""
+    depth = 0
+    types = ("1", "a", "i")
+
+    def replace(m: re.Match) -> str:
+        nonlocal depth
+        tag = m.group(0)
+        if tag.lower().startswith("</"):
+            depth = max(0, depth - 1)
+            return tag
+        list_type = types[depth % len(types)]
+        depth += 1
+        if re.search(r"\btype\s*=", tag, re.I):
+            return re.sub(r'\btype\s*=\s*(["\']).*?\1', f'type="{list_type}"', tag,
+                          count=1, flags=re.I)
+        return tag[:-1] + f' type="{list_type}">'
+
+    return ORDERED_LIST_TAG_RE.sub(replace, html_text)
+
+
+def finalize_html(html_text: str) -> str:
+    """Apply the offline layout rules after Markdown rendering."""
+    html_text = unwrap_block_in_p(html_text)
+    html_text = NAV_BLOCK_RE.sub("", html_text)
+    # Python-Markdown uses _1 for duplicate IDs; docs.pingcap.com uses -1.
+    html_text = HEADING_DUPLICATE_ID_RE.sub(r"\1\2-\3\4", html_text)
+    html_text = apply_ordered_list_types(html_text)
+    html_text = TABLE_RE.sub(r'<div class="tablewrap">\1</div>', html_text)
+    return html_text
+
+
 CSS = """
-/* TiDB Docs CHM — 兼容 hh.exe 的 IE 渲染引擎（无 flex / grid / var） */
-body{font-family:"Segoe UI","Microsoft YaHei",Tahoma,Arial,sans-serif;font-size:15px;
- line-height:1.75;color:#24292f;background:#ffffff;margin:0;padding:0 52px 72px 52px}
-h1{font-size:27px;font-weight:600;color:#0d1117;border-bottom:2px solid #d8dee4;
- padding-bottom:10px;margin:0 0 22px 0;letter-spacing:-.01em}
-h2{font-size:21px;font-weight:600;color:#0d1117;border-bottom:1px solid #eaeef2;
- padding-bottom:6px;margin-top:36px}
-h3{font-size:17px;font-weight:600;margin-top:26px}
-h4{font-size:15px;font-weight:600;margin-top:20px;color:#57606a}
-p{margin:12px 0}
-a{color:#0969da;text-decoration:none}
-a:hover{text-decoration:underline}
-ul,ol{padding-left:26px;margin:12px 0}
-li{margin:5px 0}
-code{font-family:Consolas,"Courier New",monospace;background:#f2f4f7;color:#0550ae;
- padding:2px 5px;font-size:13px}
-pre{background:#f6f8fa;border:1px solid #d8dee4;padding:14px 16px;margin:16px 0;
- overflow:auto;line-height:1.55}
-pre code{background:none;color:#24292f;padding:0;font-size:13px}
-table{border-collapse:collapse;width:100%;margin:18px 0;font-size:14px}
-th,td{border:1px solid #d8dee4;padding:8px 12px;text-align:left;vertical-align:top}
-th{background:#f6f8fa;font-weight:600;color:#0d1117}
-td{background:#ffffff}
-blockquote{border-left:4px solid #d8dee4;margin:16px 0;padding:2px 16px;color:#57606a}
-.callout{margin:18px 0;padding:12px 16px;border-left:4px solid #0969da;background:#ddf4ff}
+/* TiDB Docs CHM — 兼容 Windows hh.exe 的紧凑离线版式 */
+body{font-family:"Microsoft YaHei","PingFang SC","Segoe UI",Arial,sans-serif;
+ font-size:14px;line-height:1.65;color:#27364a;background:#fff;margin:0}
+.page{max-width:1120px;margin:0 auto;padding:22px 32px 44px}
+.brand{font-size:12px;color:#697889;border-bottom:3px solid #c83044;
+ padding-bottom:8px;letter-spacing:1px}
+a{color:#1964a3;text-decoration:none}a:hover{text-decoration:underline}
+h1{font-size:28px;line-height:1.4;color:#17283f;margin:18px 0 14px}
+h2{font-size:21px;color:#17283f;border-bottom:1px solid #dde5ee;
+ margin-top:28px;padding-bottom:6px}
+h3{font-size:18px;margin-top:22px}h4{font-size:16px;margin-top:18px}
+h1 code,h2 code,h3 code,h4 code{font-size:inherit;font-weight:inherit;color:inherit;
+ background:transparent;padding:0}
+p,ul,ol{margin:9px 0}ul,ol{padding-left:22px}
+ul ul,ul ol,ol ul,ol ol{padding-left:18px}li{margin:2px 0}
+ol{list-style-type:decimal}ol ol{list-style-type:lower-alpha}
+ol ol ol{list-style-type:lower-roman}ol ol ol ol{list-style-type:decimal}
+code,pre{font-family:Consolas,"Courier New",monospace;font-size:13px}
+code{background:#eff3f7;padding:2px 5px}
+pre{background:#f4f7fb;border:1px solid #dce4ef;border-left:3px solid #9cabbf;
+ margin:12px 0;padding:12px 14px;overflow:auto;line-height:1.5;white-space:pre}
+pre code{background:none;padding:0;color:#27364a}
+.tablewrap{margin:12px 0;overflow:auto}
+table{border-collapse:collapse;margin:0;font-size:13px;line-height:1.45;width:100%}
+td,th{border:1px solid #d8e1eb;padding:6px 9px;text-align:left;vertical-align:top}
+th{background:#eaf0f7;color:#243750}tr:nth-child(even){background:#f8fafc}
+td>ul,th>ul{margin:0;padding-left:18px}td li,th li{margin:0;line-height:1.45}
+td>p,th>p{margin:0 0 4px}td>p:last-child,th>p:last-child{margin-bottom:0}
+blockquote{background:#f1f6fb;border-left:4px solid #779cc1;
+ margin:12px 0;padding:1px 16px;color:#27364a}
+.callout{margin:12px 0;padding:10px 14px;border-left:4px solid #0969da;background:#ddf4ff}
 .callout-tip{border-left-color:#1a7f37;background:#dafbe1}
 .callout-warning,.callout-caution{border-left-color:#9a6700;background:#fff8c5}
 .callout-important{border-left-color:#cf222e;background:#ffebe9}
-.callout-title{font-weight:600;margin:0 0 6px 0;color:#0d1117}
+.callout-title{font-weight:600;margin:0 0 4px;color:#0d1117}
 .tab-pane{border:1px solid #d8dee4;border-left:3px solid #8250df;background:#fbfaff;
- padding:2px 16px 10px 16px;margin:16px 0}
-.tab-label{font-weight:600;color:#8250df;font-size:12px;letter-spacing:.06em;
- margin:10px 0 2px 0}
-.img-missing{display:block;color:#8c959f;font-size:12px;font-style:italic;
- border:1px dashed #d0d7de;background:#fbfcfd;padding:6px 10px;margin:14px 0}
-hr{border:0;border-top:1px solid #eaeef2;margin:34px 0}
-.doc-meta{color:#8c959f;font-size:12px;margin:-10px 0 24px 0}
-.doc-footer{margin-top:52px;padding-top:12px;border-top:1px solid #eaeef2;
- color:#8c959f;font-size:12px}
+ padding:2px 14px 8px;margin:12px 0}
+.tab-label{font-weight:600;color:#8250df;font-size:12px;margin:8px 0 2px}
+.img-missing{display:block;color:#66788a;font-size:12px;font-style:italic;
+ border:1px dashed #b9c5d2;background:#f8fafc;padding:5px 9px;margin:8px 0}
+img{max-width:100%;height:auto;border:0}
+hr{border:0;border-top:1px solid #dde5ee;margin:28px 0}
+.nav,.toc{display:none}
+.doc-footer{border-top:1px solid #dde5ee;margin-top:28px;padding-top:14px;
+ font-size:12px;color:#6d7e92}
 /* 封面 */
 .cover{padding-top:8px}
 .cover h1{border-bottom:0;font-size:34px;margin-bottom:6px}
@@ -630,8 +736,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <link rel="stylesheet" type="text/css" href="{css}">
 </head>
 <body>
+<div class="page">
+<div class="brand">TiDB / 中文离线文档</div>
 {body}
-<div class="doc-footer">TiDB Self-Managed Documentation &middot; 由 pingcap/docs 生成 &middot; {note}</div>
+<div class="doc-footer">来源：PingCAP docs-cn &middot; {note} &middot;
+ <a href="license.html">CC BY-SA 3.0 / 许可与说明</a></div>
+</div>
 </body>
 </html>
 """
@@ -639,12 +749,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
 def wrap_page(title: str, body: str, css: str = "style.css", subtitle: str = "",
               lang: str = "en", note: str = "已移除视频与图片资源") -> str:
-    meta_line = f'<p class="doc-meta">{html_lib.escape(subtitle)}</p>' if subtitle else ""
     return PAGE_TEMPLATE.format(
         lang=lang,
         title=html_lib.escape(title),
         css=css,
-        body=meta_line + body,
+        body=body,
         note=note,
     )
 
@@ -728,7 +837,7 @@ def build_cover(title: str, entries: list[TocEntry], doc_count: int,
         for item in walk_leaf_items(chapter):
             if item.path:
                 parts.append(
-                    f'<li><a href="{html_lib.escape(item.path[:-3] + ".html")}">'
+                    f'<li><a href="{html_lib.escape(html_name_for_doc(item.path))}">'
                     f"{html_lib.escape(item.title)}</a></li>"
                 )
         parts.append("</ul></div>")
@@ -793,7 +902,7 @@ var DATA = {payload};
 function build(items, parent, depth) {{
   items.forEach(function (it) {{
     var li = document.createElement('li');
-    var url = it.p ? it.p.replace(/\\.md$/, '.html') : '';
+    var url = it.p || '';
     if (it.c && it.c.length) {{
       var grp = document.createElement('div');
       grp.className = 'grp';
@@ -832,7 +941,8 @@ build(DATA, document.getElementById('tree'), 0);
 
 
 def _toc_to_dict(e: TocEntry) -> dict:
-    return {"t": e.title, "p": e.path, "c": [_toc_to_dict(c) for c in e.children]}
+    return {"t": e.title, "p": html_name_for_doc(e.path) if e.path else "",
+            "c": [_toc_to_dict(c) for c in e.children]}
 
 
 def walk_leaf_items(entry: TocEntry) -> list[TocEntry]:
@@ -860,7 +970,7 @@ def build_hhc(entries: list[TocEntry]) -> str:
 
     def walk(items: list[TocEntry]) -> None:
         for it in items:
-            local = it.path[:-3] + ".html" if it.path else ""
+            local = html_name_for_doc(it.path) if it.path else ""
             lines.append("<LI><OBJECT type=\"text/sitemap\">")
             lines.append(f'<param name="Name" value="{html_lib.escape(it.title, quote=True)}">')
             if local:
@@ -893,7 +1003,7 @@ def build_hhk(entries: list[TocEntry]) -> str:
         lines.append("<LI><OBJECT type=\"text/sitemap\">")
         lines.append(f'<param name="Name" value="{html_lib.escape(it.title, quote=True)}">')
         lines.append(
-            f'<param name="Local" value="{html_lib.escape(it.path[:-3] + ".html", quote=True)}">'
+            f'<param name="Local" value="{html_lib.escape(html_name_for_doc(it.path), quote=True)}">'
         )
         lines.append("</OBJECT></LI>")
     lines.append("</UL></BODY></HTML>")
@@ -908,14 +1018,8 @@ def collect_entries(entries: list[TocEntry]) -> list[TocEntry]:
     return out
 
 
-def build_hhp(title: str, chm_name: str, files: list[str], lang: str = "en",
-              target: str = "hhc") -> str:
-    """生成 HTML Help 工程文件。
-
-    target="hhc"    —— 给 Windows 官方 `hhc.exe` 用：带索引与全文搜索（Windows 侧完整功能）
-    target="chmcmd" —— 给 FPC 的 `chmcmd` 用：不写索引文件，避免第三方阅读器
-                      把索引条目平铺追加到目录树末尾（macOS 阅读器的已知行为）
-    """
+def build_hhp(title: str, chm_name: str, files: list[str], lang: str = "en") -> str:
+    """生成可直接打开的最小 HTML Help 工程，不创建窗口、索引或全文库。"""
     # hhp 是 hhc.exe 按 ANSI 读的，Language 行保持纯 ASCII，避免编码问题
     lang_line = "0x0804 Simplified Chinese" if lang == "zh" else "0x0409 English (United States)"
     lines = [
@@ -927,15 +1031,13 @@ def build_hhp(title: str, chm_name: str, files: list[str], lang: str = "en",
         f"Title={title}",
         f"Language={lang_line}",
         "Binary TOC=Yes",
-        f"Binary Index={'Yes' if target == 'hhc' else 'No'}",
-        f"Full-text search={'Yes' if target == 'hhc' else 'No'}",
+        "Binary Index=No",
+        "Full-text search=No",
         "Create CHI file=No",
         "Display compile progress=No",
         "",
         "[FILES]",
     ]
-    if target == "hhc":
-        lines.insert(4, "Index file=index.hhk")
     lines.extend(files)
     lines.extend(["", "[INFOTYPES]", ""])
     return "\n".join(lines)
@@ -944,7 +1046,7 @@ def build_hhp(title: str, chm_name: str, files: list[str], lang: str = "en",
 def to_chm_toc(entries: list[TocEntry]) -> list[TocNode]:
     nodes: list[TocNode] = []
     for e in entries:
-        node = TocNode(title=e.title, local=(e.path[:-3] + ".html") if e.path else "")
+        node = TocNode(title=e.title, local=html_name_for_doc(e.path) if e.path else "")
         for c in e.children:
             node.children.extend(to_chm_toc([c]))
         nodes.append(node)
@@ -953,7 +1055,7 @@ def to_chm_toc(entries: list[TocEntry]) -> list[TocNode]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", required=True, help="pingcap/docs 的 git 仓库路径")
+    ap.add_argument("--repo", required=True, help="pingcap/docs-cn 的 git 仓库路径")
     ap.add_argument("--out", required=True, help="输出目录")
     ap.add_argument("--title", default="TiDB Documentation")
     ap.add_argument("--chm", default="tidb-docs.chm")
@@ -963,15 +1065,15 @@ def main() -> int:
                     help="包含文档引用的图片资源（默认不包含，体积最小）")
     ap.add_argument("--prune", default="none", choices=["none", "hhp", "chm"],
                     help="打包完成后清理中间产物：none=保留 HTML 版与工程文件（默认）；"
-                         "hhp=只留 *.chm + docs.hhp/toc.hhc/index.hhk（Windows 重编用）；"
+                         "hhp=只留 *.chm + docs.hhp/toc.hhc（Windows 重编用）；"
                          "chm=只留 *.chm")
     ap.add_argument("--compiler", default="auto", choices=["auto", "builtin", "chmcmd"],
-                    help="打包器：auto=有 FPC 的 chmcmd 就用它（LZX 压缩，体积约 1/3），"
-                         "否则用内置打包器；builtin=内置（不压缩）；chmcmd=强制使用并报错")
-    ap.add_argument("--image-profile", default="original",
+                    help="打包器：auto/chmcmd=使用 FPC chmcmd 生成已验证的直接打开兼容版；"
+                         "builtin=仅供开发调试的未压缩内置打包器")
+    ap.add_argument("--image-profile", default="compact",
                     choices=sorted(IMAGE_PROFILES),
-                    help="图片压缩档位：original=原图（默认）；"
-                         "compact=宽≤1200 + PNG 256 色；tiny=宽≤1000 + PNG 128 色")
+                    help="图片压缩档位：compact=宽≤1200 + PNG 256 色（默认）；"
+                         "original=原图；tiny=宽≤1000 + PNG 128 色")
     ap.add_argument("--image-max-width", type=int, default=-1,
                     help="覆盖档位的最大宽度（像素，0=不缩放）")
     ap.add_argument("--image-colors", type=int, default=-1,
@@ -980,6 +1082,8 @@ def main() -> int:
                     help="覆盖档位的 JPEG 质量（0=不重编码）")
     ap.add_argument("--ref", default="",
                     help="TiDB 版本分支，如 release-8.5 / release-7.1（默认 master 最新）")
+    ap.add_argument("--source-ref", default="",
+                    help=argparse.SUPPRESS)
     ap.add_argument("--toc-mode", default="hhc", choices=["hhc", "binary"],
                     help="目录形态：hhc=仅嵌套目录源，侧栏最干净（默认，推荐）；"
                          "binary=二进制 #TOCIDX（Windows hh.exe 原生，"
@@ -1055,9 +1159,10 @@ def main() -> int:
     raw_map = git_read_many(repo, doc_paths)
     link_index = build_link_index(doc_paths, raw_map)
     included = set(doc_paths)
+    source_ref = args.source_ref or args.ref
     web_prefix = ("https://docs.pingcap.com/zh/tidb/" if args.lang == "zh"
                   else "https://docs.pingcap.com/tidb/")
-    web_prefix += (f"v{args.ref[len('release-'):]}/" if args.ref.startswith("release-")
+    web_prefix += (f"v{source_ref[len('release-'):]}/" if source_ref.startswith("release-")
                    else "stable/")
     for idx, path in enumerate(doc_paths, 1):
         raw = raw_map.get(path)
@@ -1067,12 +1172,12 @@ def main() -> int:
             print(f"      {idx}/{len(doc_paths)}")
         meta, body, code_blocks = clean_markdown(raw, args.images, stats, variables,
                                                  link_index, included, web_prefix)
-        html_body = unwrap_block_in_p(render_callouts(md_to_html(body, code_blocks)))
+        html_body = finalize_html(render_callouts(md_to_html(body, code_blocks)))
         title = meta.get("title") or os.path.basename(path)[:-3].replace("-", " ").title()
         summary = meta.get("summary", "")
         page = wrap_page(title, html_body, subtitle=summary, lang=args.lang,
                          note=media_note)
-        pages[path[:-3] + ".html"] = page.encode("utf-8")
+        pages[html_name_for_doc(path)] = page.encode("utf-8")
     print(f"      移除视频嵌入 {stats['videos']} 处，省略图片 {stats['images']} 张")
     print(f"      模板变量替换 {stats['vars']} 处"
           + (f"，未知变量 {stats['vars_unknown']}" if stats["vars_unknown"] else ""))
@@ -1100,7 +1205,7 @@ def main() -> int:
         img_stats: dict = {}
         raw_imgs = optimize_images(raw_imgs, img_opts, img_stats)
         for p, data in raw_imgs.items():
-            pages[p] = data
+            pages[local_asset_name(p)] = data
         print(f"      图片入库 {got}/{len(img_paths)}")
         if img_stats["images"] or img_stats["before"]:
             before = img_stats["before"] / 1048576
@@ -1117,6 +1222,12 @@ def main() -> int:
     doc_count = sum(1 for k in pages if k.endswith(".html"))
     cover = build_cover(args.title, entries, doc_count, note=media_note)
     pages["index.html"] = wrap_page(args.title, cover, note=media_note).encode("utf-8")
+    license_body = """<h1>许可与说明</h1>
+<p>本文档内容来源于 PingCAP 官方中文文档仓库 <code>pingcap/docs-cn</code>。</p>
+<p>TiDB 文档内容采用 CC BY-SA 3.0 许可；离线版本仅调整排版、链接、媒体资源和 CHM 打包结构。</p>
+<p>构建工具代码采用 MIT 许可。详细条款请参见项目仓库中的 <code>LICENSE</code> 文件。</p>"""
+    pages["license.html"] = wrap_page("许可与说明", license_body,
+                                      lang=args.lang, note=media_note).encode("utf-8")
     pages["style.css"] = CSS.encode("utf-8")
     pages["preview.html"] = build_preview(
         args.title, entries, len(pages), args.chm
@@ -1127,18 +1238,14 @@ def main() -> int:
             if name.endswith((".html", ".css")) and not pages[name].startswith(UTF8_BOM):
                 pages[name] = UTF8_BOM + pages[name]
 
-    print("[4/6] 生成 hhp / hhc / hhk（供 Windows hhc.exe 使用）")
-    # hhc/hhk 由 hh.exe 与 hhc.exe 按 ANSI 代码页解析，中文环境必须 GBK。
-    # index.hhk 不打进 CHM——部分阅读器会把索引条目平铺追加在目录树末尾
-    # （表现为"术语表下面一大串多余条目"），只保留在磁盘供 hhc.exe 使用。
+    print("[4/6] 生成直接打开兼容的 hhp / hhc")
+    # hhc 由 hh.exe 与 hhc.exe 按 ANSI 代码页解析，中文环境必须 GBK。
+    # 只生成单一传统目录，不生成关键词索引或全文搜索数据库。
     pages["toc.hhc"] = build_hhc(entries).encode("gbk")
-    pages["index.hhk"] = build_hhk(entries).encode("gbk")
     file_list = sorted(pages)
-    skip_in_chm = {"preview.html", "index.hhk"}
+    skip_in_chm = {"preview.html"}
     with open(os.path.join(out, "toc.hhc"), "wb") as fh:
         fh.write(pages["toc.hhc"])
-    with open(os.path.join(out, "index.hhk"), "wb") as fh:
-        fh.write(pages["index.hhk"])
     with open(os.path.join(out, "docs.hhp"), "wb") as fh:
         fh.write(
             build_hhp(args.title, args.chm,
@@ -1156,7 +1263,7 @@ def main() -> int:
     chm_files = [f for f in file_list if f not in skip_in_chm]
     compiler = args.compiler
     if compiler == "auto":
-        compiler = "chmcmd" if shutil.which("chmcmd") else "builtin"
+        compiler = "chmcmd"
     if compiler == "chmcmd" and not shutil.which("chmcmd"):
         print("      找不到 chmcmd（Free Pascal 的 CHM 编译器）："
               "brew install fpc，或改用 --compiler builtin", file=sys.stderr)
@@ -1167,8 +1274,7 @@ def main() -> int:
         # chmcmd 自带 LZX 压缩实现；不写索引，保持侧栏干净
         chmcmd_hhp = "docs.chmcmd.hhp"
         with open(os.path.join(out, chmcmd_hhp), "wb") as fh:
-            fh.write(build_hhp(args.title, args.chm, chm_files, args.lang,
-                               target="chmcmd").encode("gbk"))
+            fh.write(build_hhp(args.title, args.chm, chm_files, args.lang).encode("gbk"))
         res = subprocess.run(["chmcmd", "--no-html-scan", chmcmd_hhp],
                              cwd=out, capture_output=True)
         if res.returncode != 0 or not os.path.exists(chm_path):
@@ -1250,7 +1356,7 @@ def main() -> int:
     if args.prune != "none" and hygiene_ok:
         keep = {args.chm}
         if args.prune == "hhp":
-            keep |= {"docs.hhp", "toc.hhc", "index.hhk"}
+            keep |= {"docs.hhp", "toc.hhc"}
         removed, freed = prune_out_dir(
             out, [*file_list, "docs.hhp", *([chmcmd_hhp] if chmcmd_hhp else [])], keep)
         print(f"      清理中间产物 {removed} 个（-{freed / 1048576:.1f} MB），"
@@ -1323,7 +1429,7 @@ def verify_compressed_content(chm_path: str, out: str,
 def prune_out_dir(out: str, written: list[str], keep: set[str]) -> tuple[int, int]:
     """删除本次构建写出的中间产物，只保留 keep 中的文件；返回 (删除数, 释放字节)。
 
-    只动本次真正写出的文件（HTML 页面、CSS、图片、toc.hhc/index.hhk/docs.hhp），
+    只动本次真正写出的文件（HTML 页面、CSS、图片、toc.hhc/docs.hhp），
     顺带清掉因此变空的目录，不会误删目录里其它内容。
     """
     removed = 0

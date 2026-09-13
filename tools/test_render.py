@@ -51,7 +51,7 @@ def indent_lines(text: str, prefix: str) -> str:
 def render(md_text: str, keep_images: bool = False) -> str:
     stats = dict(EMPTY_STATS)
     _meta, body, code_blocks = B.clean_markdown(md_text, keep_images, stats)
-    return B.unwrap_block_in_p(B.render_callouts(B.md_to_html(body, code_blocks)))
+    return B.finalize_html(B.render_callouts(B.md_to_html(body, code_blocks)))
 
 
 def check(name: str, md_text: str, *conditions: tuple[str, bool]) -> bool:
@@ -135,6 +135,94 @@ def cases() -> bool:
     md = "- 说明：\n\n    ```toml\n    x = 1\n"
     html = render(md)
     ok &= check("未闭合围栏不吞正文", md, ("正文还在", "说明" in html))
+
+    # 10. 官网用 CSS 按层级切换有序列表标记；CHM 同时写 type 属性，
+    # 避免旧版 hh.exe 把内层 a/b/c 错显示成 1/2/3。
+    md = "1. 外层一\n\n    1. 内层一\n    2. 内层二\n\n2. 外层二\n"
+    html = render(md)
+    ok &= check("有序列表层级", md,
+                ("外层使用数字", '<ol type="1">' in html),
+                ("内层使用字母", '<ol type="a">' in html),
+                ("外层序号未被拆开", html.count('<ol type="1">') == 1))
+
+    # 11. 网页专用按钮短代码和页首 TOC 标记不应进入离线正文。
+    md = "# 标题\n\n[TOC]\n\n{{< copyable \"shell-regular\" >}}\n\n```bash\necho ok\n```\n"
+    html = render(md)
+    ok &= check("网页模板标记清理", md,
+                ("copyable 已移除", "copyable" not in html),
+                ("页内 TOC 已移除", 'class="toc"' not in html and "[TOC]" not in html),
+                ("代码仍正常", "echo ok" in html))
+
+    # 12. 宽表格需要滚动容器，不能撑出 CHM 正文区域。
+    md = "| A | B |\n|---|---|\n| 1 | 2 |\n"
+    html = render(md)
+    ok &= check("表格滚动容器", md,
+                ("表格被容器包裹", '<div class="tablewrap"><table>' in html))
+
+    # 13. 所有文章用短 ASCII 文件名，本地链接也必须指向相同映射。
+    stats = dict(EMPTY_STATS)
+    _meta, linked, _blocks = B.clean_markdown(
+        "[目标](/nested/目标.md#章节)", False, stats,
+        included={"nested/目标.md"}, web_prefix="https://example.invalid/"
+    )
+    expected = B.html_name_for_doc("nested/目标.md") + "#章节"
+    ok &= check("短 ASCII 内链", "[目标](/nested/目标.md#章节)",
+                ("链接使用哈希文件名", expected in linked),
+                ("文件名只含 ASCII", B.html_name_for_doc("nested/目标.md").isascii()))
+
+    # 14. 直接打开兼容工程只保留传统目录，不能生成自定义窗口、索引或全文库。
+    hhp = B.build_hhp("TiDB v7.5", "tidb.chm", ["index.html", "toc.hhc"])
+    ok &= check("直接打开 HHP 结构", "正文",
+                ("声明传统目录", "Contents file=toc.hhc" in hhp),
+                ("默认页正确", "Default topic=index.html" in hhp),
+                ("无自定义窗口", "[WINDOWS]" not in hhp),
+                ("无关键词索引", "Index file=" not in hhp and "Binary Index=No" in hhp),
+                ("无全文数据库", "Full-text search=No" in hhp))
+
+    # 15. 图片版资源也使用短 ASCII 文件名，避免 CHM 内部路径兼容问题。
+    stats = dict(EMPTY_STATS)
+    _meta, image_md, _blocks = B.clean_markdown("![架构图](/media/架构图.png)", True, stats)
+    asset = B.local_asset_name("/media/架构图.png")
+    ok &= check("短 ASCII 图片资源", "正文",
+                ("图片链接已映射", asset in image_md),
+                ("资源名只含 ASCII", asset.isascii()))
+
+    # 16. 标题锚点必须与官网一致并保留中文，否则 CHM 内章节链接会失效。
+    md = "## Point_Get 和 Batch_Point_Get\n\n## 第 2 步：创建 Access Key Pair\n"
+    html = render(md)
+    ok &= check("官网兼容标题锚点", md,
+                ("中英文标题锚点一致", 'id="point_get-和-batch_point_get"' in html),
+                ("中文步骤标题锚点一致", 'id="第-2-步创建-access-key-pair"' in html))
+
+    # 17. 官网重复标题使用 -1 后缀；代码标题中的 <option> 是文字，不能被当标签删掉。
+    md = ("## 重复标题\n\n## 重复标题\n\n"
+          "### `config [show | set <option> <value> | placement-rules]`\n")
+    html = render(md)
+    ok &= check("重复和代码标题锚点", md,
+                ("重复标题使用官网后缀", 'id="重复标题-1"' in html),
+                ("尖括号参数保留", 'id="config-show--set-option-value--placement-rules"' in html))
+
+    # 18. 仅把同版本官网链接本地化；跨版本链接必须继续指向原版本网页。
+    stats = dict(EMPTY_STATS)
+    source = ("[当前](https://docs.pingcap.com/zh/tidb/v7.5/target/#章节) "
+              "[旧版](https://docs.pingcap.com/zh/tidb/v7.4/target/#旧章节)")
+    _meta, linked, _blocks = B.clean_markdown(
+        source, False, stats, link_index={"target": "target.md"},
+        included={"target.md"}, web_prefix="https://docs.pingcap.com/zh/tidb/v7.5/"
+    )
+    ok &= check("官网跨版本链接", "正文",
+                ("当前版本改成本地链接", B.html_name_for_doc("target.md") + "#章节" in linked),
+                ("旧版本保持官网链接", "https://docs.pingcap.com/zh/tidb/v7.4/target/#旧章节" in linked))
+
+    # 19. 少数上游链接意外重复写了 fragment，只保留第一个有效锚点。
+    stats = dict(EMPTY_STATS)
+    _meta, linked, _blocks = B.clean_markdown(
+        "[RU](/ru.md#什么是-request-unit-ru#什么是-request-unit-ru)", False, stats,
+        included={"ru.md"}
+    )
+    ok &= check("重复锚点清理", "正文",
+                ("只保留一个 fragment",
+                 linked.endswith(B.html_name_for_doc("ru.md") + "#什么是-request-unit-ru)")))
     return ok
 
 
@@ -160,7 +248,7 @@ def corpus() -> bool:
             files += 1
             stats = dict(EMPTY_STATS)
             _meta, body, code_blocks = B.clean_markdown(raw, False, stats)
-            html = B.unwrap_block_in_p(B.render_callouts(B.md_to_html(body, code_blocks)))
+            html = B.finalize_html(B.render_callouts(B.md_to_html(body, code_blocks)))
             blocks += stats["code_blocks"]
             bad = sum(1 for m in pre_re.finditer(html) if escaped_re.search(m.group(0)))
             bad += len(B.CODE_TOKEN_RE.findall(html)) + html.count("```")
