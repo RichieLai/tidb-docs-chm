@@ -1,5 +1,9 @@
-# 构建产物（./build.sh 可完整重建，不入库）
+# 构建产物 / 中间产物（./build.sh 可完整重建，不入库）
 dist/
+*.chm
+*.hhp
+*.hhc
+*.hhk
 
 # 文档源仓库（脚本自动 git clone 到 repos/docs-cn）
 repos/

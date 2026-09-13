@@ -3,10 +3,18 @@
 把 TiDB 官方文档（`pingcap/docs-cn`，中文）打包成单个 CHM 离线文档。
 全程在 macOS / Linux 上完成，不依赖 Windows，也不依赖 Microsoft HTML Help Workshop。
 
+> **English**: `tidb-docs-chm` builds a single offline CHM from the official
+> TiDB docs repo (`pingcap/docs-cn`). Pure Python ITSF/CHM writer, optional LZX
+> compression via Free Pascal's `chmcmd`, clean TOC for third-party readers,
+> UTF-8-BOM pages, optional image bundling with palette-quantized thumbnails.
+> No Windows toolchain required. Code: MIT. TiDB documentation content: CC BY-SA 3.0
+> (© PingCAP) — see [License & attribution](#license--attribution).
+
 - 数据源：官方文档仓库，目录结构与 docs.pingcap.com 一致
 - 支持按版本分支生成（release-6.5 ~ release-8.5）
 - 默认剔除图片与视频，保证体积最小；可选保留图片
 - 产物已被 7-Zip 独立校验：结构合法、内容与源 HTML 字节级一致
+- 目录树干净（不放索引文件）、正文带 UTF-8 BOM 不乱码、链接尽量改成本地页面
 
 ## 1. 目录结构
 
@@ -411,3 +419,15 @@ CHM 内图片用的是 `/media/...` 绝对路径，`file://` 直接打开 HTML �
 - 站外链接不做转换
 - 搜索索引未生成（我们用 `chmcmd` 时关掉了全文索引以保持侧栏干净）；
   需要搜索索引可用 `--keep-hhp` 后在 Windows 端 `hhc.exe` 重编
+
+## 12. License & attribution
+
+- **本仓库代码**（`tools/`、`build.sh`、`Makefile` 等）：MIT，见 [LICENSE](LICENSE)。
+- **文档内容**：来自 [`pingcap/docs-cn`](https://github.com/pingcap/docs-cn)，
+  版权归 PingCAP 所有，采用 [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/)
+  许可。本工具不镜像内容，只在构建时从上游仓库拉取并打包；生成的 CHM 亦然，
+  分发时请保留署名与相同许可。
+- **`docs/screenshots/`**：截图内容为上述文档的渲染结果（含 TiDB 文档正文与
+  Grafana/监控截图），因此同样按 CC BY-SA 3.0 使用。
+- 本项目与 PingCAP 无隶属关系，仅为第三方离线阅读工具；文档内容以
+  [docs.pingcap.com](https://docs.pingcap.com/zh/tidb/stable) 为准。
