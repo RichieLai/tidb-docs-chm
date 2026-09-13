@@ -194,7 +194,8 @@ def strip_videos(text: str, stats: dict) -> str:
 
 
 FENCE_LINE_RE = re.compile(
-    r"^(?P<indent>[ \t]*)(?P<mark>`{3,}|~{3,})[ \t]*(?P<lang>[A-Za-z0-9_+#.-]*).*$"
+    r"^(?P<quote>(?:>[ \t]?)*)(?P<indent>[ \t]*)(?P<mark>`{3,}|~{3,})[ \t]*"
+    r"(?P<lang>[A-Za-z0-9_+#.-]*).*$"
 )
 
 
@@ -215,9 +216,11 @@ def convert_fences(text: str, stats: dict) -> str:
             out.append(lines[i])
             i += 1
             continue
-        indent, mark, lang = m.group("indent"), m.group("mark"), m.group("lang")
+        quote, indent, mark, lang = (m.group("quote"), m.group("indent"),
+                                     m.group("mark"), m.group("lang"))
         closing = re.compile(
-            r"^[ \t]*" + re.escape(mark[0]) + "{" + str(len(mark)) + r",}[ \t]*$"
+            "^" + re.escape(quote) + r"[ \t]*" + re.escape(mark[0])
+            + "{" + str(len(mark)) + r",}[ \t]*$"
         )
         body: list[str] = []
         j = i + 1
@@ -228,13 +231,16 @@ def convert_fences(text: str, stats: dict) -> str:
             out.append(lines[i])
             i += 1
             continue
-        dedented = [
-            (ln[len(indent):] if indent and ln.startswith(indent) else ln)
-            for ln in body
-        ]
+        dedented = []
+        for ln in body:
+            if quote and ln.startswith(quote):
+                ln = ln[len(quote):]
+            if indent and ln.startswith(indent):
+                ln = ln[len(indent):]
+            dedented.append(ln)
         code = html_lib.escape("\n".join(dedented))
         cls = f' class="language-{lang}"' if lang else ""
-        out.append(f"{indent}<pre><code{cls}>{code}</code></pre>")
+        out.append(f"{quote}{indent}<pre><code{cls}>{code}</code></pre>")
         count += 1
         i = j + 1
     stats["code_blocks"] = stats.get("code_blocks", 0) + count
@@ -363,6 +369,9 @@ def clean_markdown(text: str, keep_images: bool, stats: dict,
     meta, body = split_frontmatter(text)
     body = convert_fences(body, stats)
     if variables:
+        # 标题/摘要也会展示在页面上，同样要做变量替换
+        meta = {k: apply_template_vars(v, variables, stats) if isinstance(v, str) else v
+                for k, v in meta.items()}
         body = apply_template_vars(body, variables, stats)
     body = normalize_blocks(body)
     body = strip_videos(body, stats)
