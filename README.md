@@ -87,21 +87,16 @@ cd tidb-docs-chm
 
 ```text
 dist/tidb-docs-7.5/tidb-docs-7.5.chm
-dist/tidb-docs-7.5/open-chm.cmd
 dist/tidb-docs-7.5-images/tidb-docs-7.5-images.chm
-dist/tidb-docs-7.5-images/open-chm.cmd
 ```
 
-### Windows 首次打开
+### Windows 下载后无法打开
 
 Windows 会给浏览器、聊天软件或邮件下载的文件添加“网络来源”标记。HTML Help
 可能因此直接提示 `无法打开文件: mk:@MSITStore:...`，即使 CHM 内容本身完整。
 
-首次打开或重新下载后，双击与 CHM 同目录的 `open-chm.cmd`。它只执行两步：调用
-PowerShell 的 `Unblock-File` 移除该 CHM 的 `Zone.Identifier`，然后打开 CHM；以后
-可以直接双击 CHM。也可以右键 CHM，选择“属性”，勾选“解除锁定”后确定。
-
-手动命令：
+遇到该提示时，可以右键 CHM，选择“属性”，勾选“解除锁定”后确定；也可以在
+PowerShell 中手动移除该 CHM 的 `Zone.Identifier`：
 
 ```powershell
 Unblock-File -LiteralPath "C:\tidb-docs-7.5.chm"

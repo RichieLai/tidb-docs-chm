@@ -279,21 +279,14 @@ def cases() -> bool:
                 ("只保留一个 fragment",
                  linked.endswith(B.html_name_for_doc("ru.md") + "#什么是-request-unit-ru)")))
 
-    # 20. 下载后的 Windows 首次打开脚本只解除目标 CHM 的网络来源锁定。
-    launcher = B.WINDOWS_LAUNCHER.format(chm_name="tidb-docs-7.5.chm")
-    ok &= check("Windows 首次打开脚本", "正文",
-                ("目标文件名固定", 'tidb-docs-7.5.chm' in launcher),
-                ("调用系统解除锁定命令", "Unblock-File -LiteralPath $env:CHM_FILE" in launcher),
-                ("解除后打开 CHM", 'start "" "%CHM_FILE%"' in launcher))
-
-    # 21. auto 优先压缩，但缺少 chmcmd 时必须能离线回退构建。
+    # 20. auto 优先压缩，但缺少 chmcmd 时必须能离线回退构建。
     ok &= check("打包器自动选择", "正文",
                 ("有 chmcmd 时压缩", B.choose_compiler("auto", True) == "chmcmd"),
                 ("缺少时回退内置", B.choose_compiler("auto", False) == "builtin"),
                 ("强制模式不改变", B.choose_compiler("chmcmd", False) == "chmcmd"
                  and B.choose_compiler("builtin", True) == "builtin"))
 
-    # 22. Windows 要求 ITSF Section 0 固定为 0x18 字节，ITSP 目录紧随其后，
+    # 21. Windows 要求 ITSF Section 0 固定为 0x18 字节，ITSP 目录紧随其后，
     # 正文位于目录之后。旧的 content -> directory 顺序会触发 mk:@MSITStore 错误。
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "layout.chm")

@@ -11,7 +11,7 @@
 #   ./build.sh --keep-html    # 额外保留 HTML 版与 hhc/hhp 工程文件
 #   ./build.sh --no-compress  # 强制使用未压缩的内置打包器
 #
-# 产物默认保留 CHM 和首次打开脚本；HTML/工程文件构建成功后自动清理。
+# 产物默认只保留 CHM；HTML/工程文件构建成功后自动清理。
 # 含图片版默认同时做两层压缩：图片 compact 档（宽≤1200 + PNG 256 色）+ CHM LZX。
 # 默认优先用 FPC chmcmd 做 LZX 压缩；未安装时自动使用内置未压缩打包器。
 # 幂等可重复执行：venv、源码仓库、产物均自动准备/更新。
@@ -194,14 +194,13 @@ build_target() {
 
     log "完成：${title}"
     echo "  离线文档 : $chm_path"
-    echo "  Windows   : $out/open-chm.cmd（首次打开或下载后双击）"
     if [ "$PRUNE" = "none" ]; then
         echo "  效果预览 : $out/preview.html"
         echo "  官方工程 : $out/docs.hhp（Windows 上 hhc.exe docs.hhp 可重编标准 CHM）"
     elif [ "$PRUNE" = "hhp" ]; then
         echo "  官方工程 : $out/docs.hhp（Windows 上 hhc.exe docs.hhp 可重编标准 CHM）"
     else
-        echo "  仅保留   : CHM + open-chm.cmd（HTML/工程文件已清理）"
+        echo "  仅保留   : CHM（HTML/工程文件已清理）"
     fi
     CHM_LIST+=("$chm_path")
 }
