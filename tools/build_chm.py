@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -710,6 +711,7 @@ h1 code,h2 code,h3 code,h4 code{font-size:inherit;font-weight:inherit;color:inhe
  background:transparent;padding:0}
 p,ul,ol{margin:9px 0}ul,ol{padding-left:22px}
 ul ul,ul ol,ol ul,ol ol{padding-left:18px}li{margin:2px 0}
+ul{list-style-type:disc}ul ul{list-style-type:circle}ul ul ul{list-style-type:square}
 ol{list-style-type:decimal}ol ol{list-style-type:lower-alpha}
 ol ol ol{list-style-type:lower-roman}ol ol ol ol{list-style-type:decimal}
 code,pre{font-family:Consolas,"Courier New",monospace;font-size:13px}
@@ -730,15 +732,15 @@ blockquote{background:#f1f6fb;border-left:4px solid #779cc1;
 .callout-warning,.callout-caution{border-left-color:#9a6700;background:#fff8c5}
 .callout-important{border-left-color:#cf222e;background:#ffebe9}
 .callout-title{font-weight:600;margin:0 0 4px;color:#0d1117}
-.tab-pane{border:1px solid #d8dee4;border-left:3px solid #8250df;background:#fbfaff;
+.tab-pane{border:1px solid #d8e1eb;border-left:3px solid #1964a3;background:#f7fbff;
  padding:2px 14px 8px;margin:12px 0}
-.tab-label{font-weight:600;color:#8250df;font-size:12px;margin:8px 0 2px}
+.tab-label{font-weight:600;color:#1964a3;font-size:12px;margin:8px 0 2px}
 .img-missing{display:block;color:#66788a;font-size:12px;font-style:italic;
  border:1px dashed #b9c5d2;background:#f8fafc;padding:5px 9px;margin:8px 0}
 img{max-width:100%;height:auto;border:0}
 hr{border:0;border-top:1px solid #dde5ee;margin:28px 0}
 .nav,.toc{display:none}
-.doc-footer{border-top:1px solid #dde5ee;margin-top:28px;padding-top:14px;
+.doc-footer,.footer{border-top:1px solid #dde5ee;margin-top:28px;padding-top:14px;
  font-size:12px;color:#6d7e92}
 /* 封面 */
 .cover{padding-top:8px}
@@ -756,15 +758,16 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="{lang}">
 <head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
 <title>{title}</title>
 <link rel="stylesheet" type="text/css" href="{css}">
 </head>
 <body>
 <div class="page">
-<div class="brand">TiDB / 中文离线文档</div>
+<div class="brand">TiDB{version_label} ・ 中文离线文档</div>
 {body}
-<div class="doc-footer">来源：PingCAP docs-cn &middot; {note} &middot;
- <a href="license.html">CC BY-SA 3.0 / 许可与说明</a></div>
+<div class="footer">来源：PingCAP docs-cn ・ {source_ref} ・ 离线整理日期：{build_date}<br>
+保留原文内容；调整离线排版、链接及图片。<a href="license.html">CC BY-SA 3.0 / 许可与说明</a></div>
 </div>
 </body>
 </html>
@@ -772,13 +775,18 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
 
 def wrap_page(title: str, body: str, css: str = "style.css", subtitle: str = "",
-              lang: str = "en", note: str = "已移除视频与图片资源") -> str:
+              lang: str = "en", note: str = "已移除视频与图片资源",
+              source_ref: str = "") -> str:
+    version = source_ref[len("release-"):] if source_ref.startswith("release-") else ""
     return PAGE_TEMPLATE.format(
         lang=lang,
         title=html_lib.escape(title),
         css=css,
         body=body,
         note=note,
+        version_label=f" / v{html_lib.escape(version)}" if version else "",
+        source_ref=html_lib.escape(source_ref or "本地源码"),
+        build_date=date.today().isoformat(),
     )
 
 
@@ -1206,7 +1214,7 @@ def main() -> int:
         title = meta.get("title") or os.path.basename(path)[:-3].replace("-", " ").title()
         summary = meta.get("summary", "")
         page = wrap_page(title, html_body, subtitle=summary, lang=args.lang,
-                         note=media_note)
+                         note=media_note, source_ref=source_ref)
         pages[html_name_for_doc(path)] = page.encode("utf-8")
     print(f"      移除视频嵌入 {stats['videos']} 处，省略图片 {stats['images']} 张")
     print(f"      模板变量替换 {stats['vars']} 处"
@@ -1251,13 +1259,16 @@ def main() -> int:
     print("[3/6] 生成封面与资源")
     doc_count = sum(1 for k in pages if k.endswith(".html"))
     cover = build_cover(args.title, entries, doc_count, note=media_note)
-    pages["index.html"] = wrap_page(args.title, cover, note=media_note).encode("utf-8")
+    pages["index.html"] = wrap_page(
+        args.title, cover, note=media_note, source_ref=source_ref
+    ).encode("utf-8")
     license_body = """<h1>许可与说明</h1>
 <p>本文档内容来源于 PingCAP 官方中文文档仓库 <code>pingcap/docs-cn</code>。</p>
 <p>TiDB 文档内容采用 CC BY-SA 3.0 许可；离线版本仅调整排版、链接、媒体资源和 CHM 打包结构。</p>
 <p>构建工具代码采用 MIT 许可。详细条款请参见项目仓库中的 <code>LICENSE</code> 文件。</p>"""
     pages["license.html"] = wrap_page("许可与说明", license_body,
-                                      lang=args.lang, note=media_note).encode("utf-8")
+                                      lang=args.lang, note=media_note,
+                                      source_ref=source_ref).encode("utf-8")
     pages["style.css"] = CSS.encode("utf-8")
     pages["preview.html"] = build_preview(
         args.title, entries, len(pages), args.chm

@@ -74,6 +74,18 @@ def cases() -> bool:
     print("[1/2] 渲染用例")
     ok = True
 
+    # hh.exe may otherwise fall back to an old document mode. That mode renders
+    # list markers as oversized circles and changes spacing compared with the
+    # verified reference CHM.
+    sample_page = B.wrap_page("样式测试", "<ul><li>一级</li></ul>", lang="zh")
+    ok &= check("Windows 文档模式与列表样式", "正文",
+                ("强制使用最新 MSHTML 文档模式",
+                 '<meta http-equiv="X-UA-Compatible" content="IE=edge">' in sample_page),
+                ("明确三级无序列表标记",
+                 "ul{list-style-type:disc}" in B.CSS
+                 and "ul ul{list-style-type:circle}" in B.CSS
+                 and "ul ul ul{list-style-type:square}" in B.CSS))
+
     # 1. 顶层围栏
     html = render(f"说明：\n\n{CODE}\n")
     ok &= check("顶层代码块", f"说明：\n\n{CODE}\n",
