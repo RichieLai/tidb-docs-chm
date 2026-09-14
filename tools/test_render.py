@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -237,6 +239,24 @@ def cases() -> bool:
                 ("缺少时回退内置", B.choose_compiler("auto", False) == "builtin"),
                 ("强制模式不改变", B.choose_compiler("chmcmd", False) == "chmcmd"
                  and B.choose_compiler("builtin", True) == "builtin"))
+
+    # 22. Windows 要求 ITSF Section 0 固定为 0x18 字节，ITSP 目录紧随其后，
+    # 正文位于目录之后。旧的 content -> directory 顺序会触发 mk:@MSITStore 错误。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "layout.chm")
+        writer = B.ChmWriter(title="TiDB", default_page="index.html", toc_name="toc.hhc")
+        writer.add_file("index.html", b"<html>ok</html>")
+        writer.add_file("toc.hhc", b"<html></html>")
+        writer.write(path)
+        with open(path, "rb") as fh:
+            binary = fh.read()
+        section0_offset, section0_len, directory_offset, directory_len, data_offset = \
+            struct.unpack_from("<5Q", binary, 0x38)
+        ok &= check("Windows CHM 二进制布局", "正文",
+                    ("Section 0 固定长度", section0_offset == 0x60 and section0_len == 0x18),
+                    ("ITSP 紧随 Section 0", directory_offset == 0x78
+                     and binary[directory_offset:directory_offset + 4] == b"ITSP"),
+                    ("正文位于目录之后", data_offset == directory_offset + directory_len))
     return ok
 
 

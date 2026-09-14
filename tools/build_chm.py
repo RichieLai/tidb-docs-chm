@@ -1338,6 +1338,12 @@ def main() -> int:
     from chmwriter import ChmReader
 
     reader = ChmReader(chm_path)
+    layout_ok = reader.windows_layout_ok()
+    print(f"      Windows ITSF 布局校验 {'OK' if layout_ok else '失败'}")
+    if not layout_ok:
+        print("      [失败] Section 0、ITSP 目录和正文数据的偏移不符合 hh.exe 要求",
+              file=sys.stderr)
+        return 1
     expect = {"/" + n for n in file_list if n not in skip_in_chm} | {"/#SYSTEM"}
     if args.toc_mode == "binary":
         expect |= {"/#TOCIDX", "/#TOPICS", "/#STRINGS"}

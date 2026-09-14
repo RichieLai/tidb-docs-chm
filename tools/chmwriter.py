@@ -553,13 +553,16 @@ class ChmWriter:
         entries.sort(key=lambda e: e[0].lower())
         directory = self._build_directory(entries)
 
+        # 标准 ITSF v3 布局必须是：ITSF header -> 0x18 字节 Header Section 0
+        # -> ITSP directory -> content。旧实现把 content 算进 Section 0 并放在
+        # directory 前；项目自己的 reader 能按 data_offset 读回，但 Windows
+        # hh.exe 会直接报“无法打开文件: mk:@MSITStore:...”。
         itsf_len = 0x60
-        section0_prefix_len = 0x18
-        data_offset = itsf_len + section0_prefix_len   # 文件内容的绝对基址
+        section0_len = 0x18
         section0_offset = itsf_len
-        section0_len = section0_prefix_len + len(payload)
         dir_offset = section0_offset + section0_len
-        file_size = dir_offset + len(directory)
+        data_offset = dir_offset + len(directory)
+        file_size = data_offset + len(payload)
 
         section0 = (
             _u32(0x01FE)            # 固定标识
@@ -567,7 +570,6 @@ class ChmWriter:
             + _u64(file_size)       # 整个 CHM 文件大小
             + _u32(0)
             + _u32(0)
-            + bytes(payload)
         )
 
         itsf = bytearray()
@@ -590,6 +592,7 @@ class ChmWriter:
             fh.write(bytes(itsf))
             fh.write(section0)
             fh.write(directory)
+            fh.write(bytes(payload))
 
     def _collect_toc_files(self) -> list[tuple[str, bytes]]:
         binary_toc = BinaryToc() if self.toc else None
@@ -678,3 +681,19 @@ class ChmReader:
 
     def listing(self) -> list[str]:
         return sorted(self.files)
+
+    def windows_layout_ok(self) -> bool:
+        """Check the conventional ITSF v3 order required by Windows hh.exe."""
+        d = self.data
+        if len(d) < 0x60 or d[:4] != b"ITSF" or self.version != 3:
+            return False
+        section0_offset, section0_len, directory_offset, directory_len, data_offset = \
+            struct.unpack_from("<5Q", d, 0x38)
+        return (
+            section0_offset == 0x60
+            and section0_len == 0x18
+            and directory_offset == 0x78
+            and d[directory_offset:directory_offset + 4] == b"ITSP"
+            and data_offset == directory_offset + directory_len
+            and data_offset <= len(d)
+        )

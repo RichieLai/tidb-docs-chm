@@ -96,6 +96,10 @@ macOS 阅读器侧栏仍干净（用"有索引 / 无索引"两个变体对照复
 **证据**：[`screenshots/07-lzx-compressed.jpg`](screenshots/07-lzx-compressed.jpg)
 （2.5 MB 的 LZX 压缩产物在阅读器中的效果）。
 
+内置打包器同样遵循标准 ITSF v3 顺序：`0x60` 字节 ITSF 头、固定 `0x18` 字节
+Header Section 0、ITSP 目录、正文数据。回归测试会直接核对五个 64 位偏移字段和
+ITSP 签名；正文不得放进 Section 0，否则 Windows 会报 `mk:@MSITStore` 无法打开。
+
 ## 5. 正文格式与链接（站点私有写法）
 
 **现象**：部分页面（如"部署本地测试集群"）整段排版塌掉——`>` 引用、```` ``` ````

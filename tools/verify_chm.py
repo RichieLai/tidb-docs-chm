@@ -15,6 +15,7 @@ verify_chm.py —— 检查 CHM 的直接打开、离线资源、目录与版式
   6. 是否残留网页模板、页首导航、远程显示资源或本地断链
   7. 有序列表是否明确写入层级类型
   8. ``/#SYSTEM`` 是否明确声明 ``index.html`` 和 ``toc.hhc``
+  9. ITSF 是否按 Section 0、ITSP 目录、正文的 Windows 标准顺序写入
 
 用法：
     python3 tools/verify_chm.py dist/tidb-docs-cn/tidb-docs-cn.chm
@@ -146,6 +147,12 @@ def main() -> int:
     print(f"全文数据库: {', '.join(fulltext_files) if fulltext_files else '无'}")
 
     ok = True
+    layout_ok = reader.windows_layout_ok()
+    print(f"ITSF 布局 : {'Windows 标准顺序' if layout_ok else '偏移或写入顺序错误'}")
+    if not layout_ok:
+        ok = False
+        print("  [失败] 必须按 Section 0 -> ITSP 目录 -> 正文顺序写入，"
+              "否则 hh.exe 会报 mk:@MSITStore 无法打开")
     try:
         system = reader.read("/#SYSTEM")
     except KeyError:
