@@ -18,7 +18,7 @@
 - 默认检测 Free Pascal `chmcmd`：存在时生成 LZX 压缩 CHM，缺少时自动使用内置未压缩打包器。
 - 正文 HTML 和 CSS 使用 UTF-8 BOM。
 - `toc.hhc` 使用 GBK，适配简体中文 Windows 的 HTML Help 解析器。
-- 使用一个传统 `toc.hhc` 目录；不创建自定义 `#WINDOWS` 窗口。
+- 同时生成传统 `toc.hhc` 和 Windows 原生二进制目录；前者供第三方阅读器保持层级，后者保证 `hh.exe` 直接打开。
 - 不生成关键词索引、二进制索引或全文搜索数据库。
 - 默认入口固定为 `index.html`。
 - 每篇正文使用 `p` 加 16 位十六进制哈希，图片使用 `m` 加哈希及原扩展名；所有

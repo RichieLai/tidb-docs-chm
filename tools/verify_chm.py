@@ -3,11 +3,10 @@
 verify_chm.py —— 检查 CHM 的直接打开、离线资源、目录与版式规则。
 
 背景：第三方阅读器（macOS 上的"CHM 阅读器-畅享版"、CHM Reader - Enjoy 等）
-除目录树外，还会把 CHM 内的**索引文件**（``*.hhk`` / ``#IDXHDR``）和
-**二进制目录树**（``/#TOCIDX`` 等）合并进侧栏，表现为目录树末尾多出一长串
-平铺条目（例如"术语表"下面接着一篇篇文档名）。本脚本用于独立核对：
+除目录树外，还可能把 CHM 内的**索引文件**（``*.hhk`` / ``#IDXHDR``）合并进
+侧栏，表现为目录树末尾多出一长串平铺条目。本脚本用于独立核对：
 
-  1. 目录来源（``/toc.hhc`` 还是二进制 ``/#TOCIDX``）
+  1. ``/toc.hhc`` 与 Windows 原生二进制目录是否完整
   2. 是否混入索引文件（会污染侧栏）
   3. 目录树统计：顶层章节数、节点总数、最大层级
   4. 目录指向的 HTML 是否都在 CHM 内
@@ -173,11 +172,18 @@ def main() -> int:
     if fulltext_files:
         ok = False
         print("  [失败] 直接打开兼容版不应包含全文搜索数据库")
-    if binary and not hhc:
-        print("  [提示] 只有二进制目录树：部分第三方阅读器会把整棵树平铺成一级列表")
-    if binary and hhc:
-        print("  [提示] 同时存在两种目录源（toc.hhc + 二进制目录树）："
-              "第三方阅读器优先用 toc.hhc，实测侧栏正常")
+    missing_binary = sorted(set(BINARY_TOC) - set(binary))
+    binary_flag = 11 in records
+    if missing_binary or not binary_flag:
+        ok = False
+        print(f"  [失败] Windows 原生目录不完整：缺少 {missing_binary or '无'}，"
+              f"/#SYSTEM 二进制目录标志 {'存在' if binary_flag else '缺失'}")
+        print("  [失败] 这种不一致会使 Windows hh.exe 报 mk:@MSITStore 无法打开")
+    elif not hhc:
+        ok = False
+        print("  [失败] 缺少 toc.hhc，第三方阅读器可能无法显示正确层级")
+    else:
+        print("  [通过] toc.hhc 与 Windows 原生二进制目录均完整")
 
     if hhc and (root or readable):
         text = read_bytes(hhc[0]).decode("gbk", "replace")

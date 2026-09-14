@@ -1116,9 +1116,8 @@ def main() -> int:
     ap.add_argument("--source-ref", default="",
                     help=argparse.SUPPRESS)
     ap.add_argument("--toc-mode", default="hhc", choices=["hhc", "binary"],
-                    help="目录形态：hhc=仅嵌套目录源，侧栏最干净（默认，推荐）；"
-                         "binary=二进制 #TOCIDX（Windows hh.exe 原生，"
-                         "但部分第三方阅读器会把全部条目平铺）")
+                    help="兼容参数；生成文件始终同时包含 toc.hhc 和 Windows "
+                         "hh.exe 所需的二进制目录树")
     ap.add_argument("--all", action="store_true", help="收录 TOC.md 中的全部章节")
     ap.add_argument("--lang", default="zh", choices=["zh", "en"],
                     help="zh: 中文文档（GBK 目录 + 0x0804），en: 英文")
@@ -1326,7 +1325,10 @@ def main() -> int:
             language_id=0x0804 if args.lang == "zh" else 0x0409,
             toc_name="toc.hhc",
             index_name="",  # 不声明索引：避免阅读器把索引条目平铺进目录树
-            include_binary_toc=(args.toc_mode == "binary"),
+            # Windows hh.exe 会读取 /#SYSTEM 的二进制目录标志。只写 toc.hhc
+            # 而缺少以下系统流时，部分 Windows 版本会在打开入口阶段报
+            # mk:@MSITStore 无法打开。因此内置打包也始终生成两种目录源。
+            include_binary_toc=True,
         )
         for name in chm_files:
             writer.add_file(name, pages[name])
@@ -1345,13 +1347,16 @@ def main() -> int:
               file=sys.stderr)
         return 1
     expect = {"/" + n for n in file_list if n not in skip_in_chm} | {"/#SYSTEM"}
-    if args.toc_mode == "binary":
-        expect |= {"/#TOCIDX", "/#TOPICS", "/#STRINGS"}
+    binary_toc_required = {"/#TOCIDX", "/#TOPICS", "/#STRINGS", "/#URLTBL", "/#URLSTR"}
+    expect |= binary_toc_required
     missing = sorted(expect - set(reader.files))
     ok_toc = True
-    if args.toc_mode == "binary":
+    if not (binary_toc_required - set(reader.files)):
         ok_toc = reader.read("/#TOCIDX")[:4] == struct_pack_blocksize()
-        print(f"      #TOCIDX 头部校验 {'OK' if ok_toc else '失败'}")
+        print(f"      Windows 二进制目录校验 {'OK' if ok_toc else '失败'}")
+    else:
+        ok_toc = False
+        print("      Windows 二进制目录校验 失败")
     print(f"      文件条目 {len(reader.files)} 个，缺失 {len(missing)} 个")
     if missing:
         print("      缺失：", missing[:10])
@@ -1368,9 +1373,8 @@ def main() -> int:
                 print("      [失败] 压缩包内容与源文件不一致", file=sys.stderr)
                 return 1
 
-    # 目录卫生检查：侧栏目录只允许来自 toc.hhc。
-    # 索引文件（*.hhk）与二进制目录树会被第三方阅读器合并进目录面板，
-    # 表现为"术语表下面一长串平铺条目"，必须保证不被打进 CHM。
+    # 索引文件会污染第三方阅读器侧栏；Windows 原生二进制目录必须保留，
+    # toc.hhc 则供第三方阅读器恢复正确层级。
     leaked_index = sorted(
         n for n in reader.files
         if n.lower().endswith(".hhk") or n.startswith("/#IDXHDR")
@@ -1384,16 +1388,14 @@ def main() -> int:
     if leaked_index:
         hygiene_ok = False
         print(f"      [失败] CHM 内混入索引文件：{leaked_index}")
-    if binary_entries and compiler == "chmcmd":
-        print("      （附带二进制目录树：Windows hh.exe 原生导航用，"
-              "实测不影响第三方阅读器，因为同时有 toc.hhc 且无索引）")
-    elif binary_entries and args.toc_mode != "binary":
+    missing_binary = sorted(binary_toc_required - set(binary_entries))
+    if missing_binary:
         hygiene_ok = False
-        print(f"      [失败] CHM 内混入二进制目录树：{binary_entries}")
+        print(f"      [失败] Windows 二进制目录不完整：缺少 {missing_binary}")
+    else:
+        print("      二进制目录完整：供 Windows hh.exe 启动和导航；toc.hhc 供第三方阅读器")
     if hygiene_ok:
-        toc_source = "二进制 #TOCIDX" if args.toc_mode == "binary" else "/toc.hhc"
-        print(f"      目录卫生检查 OK：侧栏目录来源仅 {toc_source}，"
-              f"无 *.hhk 索引与额外汇总条目")
+        print("      目录卫生检查 OK：无 *.hhk 索引与额外汇总条目")
 
     if args.prune != "none" and hygiene_ok:
         keep = {args.chm, launcher_name}
@@ -1414,7 +1416,7 @@ def main() -> int:
     print(f"  Windows   : {os.path.join(out, launcher_name)}（首次打开或下载后使用）")
     if args.prune != "chm":
         print(f"  HHP 工程  : {os.path.join(out, 'docs.hhp')}（Windows: hhc.exe docs.hhp）")
-    return 0 if hygiene_ok else 1
+    return 0 if hygiene_ok and not missing and ok_toc else 1
 
 
 def struct_pack_blocksize() -> bytes:

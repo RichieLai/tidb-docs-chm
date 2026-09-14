@@ -21,6 +21,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import build_chm as B  # noqa: E402
+from chmwriter import ChmReader  # noqa: E402
 
 EMPTY_STATS = {
     "videos": 0, "images": 0, "image_paths": [], "vars": 0, "vars_unknown": {},
@@ -244,9 +245,14 @@ def cases() -> bool:
     # 正文位于目录之后。旧的 content -> directory 顺序会触发 mk:@MSITStore 错误。
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "layout.chm")
-        writer = B.ChmWriter(title="TiDB", default_page="index.html", toc_name="toc.hhc")
+        writer = B.ChmWriter(title="TiDB", default_page="index.html", toc_name="toc.hhc",
+                             include_binary_toc=True)
         writer.add_file("index.html", b"<html>ok</html>")
+        writer.add_file("page.html", b"<html>page</html>")
         writer.add_file("toc.hhc", b"<html></html>")
+        root = B.TocNode("Home", "index.html")
+        root.add(B.TocNode("Page", "page.html"))
+        writer.add_toc(root)
         writer.write(path)
         with open(path, "rb") as fh:
             binary = fh.read()
@@ -257,6 +263,33 @@ def cases() -> bool:
                     ("ITSP 紧随 Section 0", directory_offset == 0x78
                      and binary[directory_offset:directory_offset + 4] == b"ITSP"),
                     ("正文位于目录之后", data_offset == directory_offset + directory_len))
+        reader = ChmReader(path)
+        binary_toc = {"/#TOCIDX", "/#TOPICS", "/#STRINGS", "/#URLTBL", "/#URLSTR"}
+        system_records = {}
+        system = reader.read("/#SYSTEM")
+        pos = 4
+        while pos + 4 <= len(system):
+            code, size = struct.unpack_from("<HH", system, pos)
+            system_records[code] = system[pos + 4:pos + 4 + size]
+            pos += 4 + size
+        ok &= check("Windows CHM 启动目录", "正文",
+                    ("五个二进制目录流完整", binary_toc <= set(reader.files)),
+                    ("SYSTEM 声明二进制目录", 11 in system_records))
+
+        # 没有写二进制目录时，/#SYSTEM 也不能谎报它存在。
+        plain = os.path.join(tmp, "plain.chm")
+        plain_writer = B.ChmWriter(include_binary_toc=False)
+        plain_writer.add_file("index.html", b"<html>ok</html>")
+        plain_writer.write(plain)
+        system = ChmReader(plain).read("/#SYSTEM")
+        codes = []
+        pos = 4
+        while pos + 4 <= len(system):
+            code, size = struct.unpack_from("<HH", system, pos)
+            codes.append(code)
+            pos += 4 + size
+        ok &= check("SYSTEM 与目录流一致", "正文",
+                    ("无目录流时不声明记录 11", 11 not in codes))
     return ok
 
 

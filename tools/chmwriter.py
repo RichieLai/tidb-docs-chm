@@ -163,11 +163,13 @@ class UrlPool:
         order = sorted(range(len(self.entries)), key=lambda i: self.entries[i][0])
         buf = bytearray()
         offsets: dict[int, int] = {}
-        for src_pos, i in enumerate(order):
+        for i in order:
             h, topic, url_off = self.entries[i]
             if len(buf) & 0xFFC == 0xFFC:  # 不跨 0x1000 块
                 buf.extend(_u32(0))
-            offsets[src_pos] = len(buf)
+            # add() 返回的是写入前的条目序号；排序后仍须用原序号回填
+            # #TOPICS。若使用排序后的位置，页面会指向错误的 URLTBL 条目。
+            offsets[i] = len(buf)
             buf.extend(_u32(h))
             buf.extend(_u32(topic))
             buf.extend(_u32(url_off))
@@ -337,9 +339,8 @@ class ChmWriter:
         self.default_font = default_font
         self.toc_name = toc_name
         self.index_name = index_name
-        # True 时写入二进制目录树（/#TOCIDX 等五个文件）。
-        # hh.exe 原生支持，但部分第三方阅读器会把全部条目平铺成一级列表，
-        # 因此默认关闭，仅携带 toc.hhc（层级正确的目录源）。
+        # True 时写入 Windows hh.exe 启动和导航所需的二进制目录树
+        #（/#TOCIDX 等五个文件）。同时保留 toc.hhc 供第三方阅读器使用。
         self.include_binary_toc = include_binary_toc
         self.files: list[tuple[str, bytes]] = []   # ("/path/in/chm", data)
         self.toc: list[TocNode] = []
@@ -398,7 +399,8 @@ class ChmWriter:
             rec_str(0, self.toc_name)   # 目录文件（供第三方阅读器使用）
         if self.index_name:
             rec_str(1, self.index_name)
-        rec(11, _u32(0))                # 11: 存在二进制 TOC
+        if self.include_binary_toc:
+            rec(11, _u32(0))            # 11: 存在二进制 TOC
         return bytes(out)
 
     # -- 目录块 -----------------------------------------------------------
