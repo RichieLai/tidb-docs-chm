@@ -75,10 +75,10 @@
 
 ## 4. LZX 压缩
 
-**做法**：不自己写压缩器，直接复用 Free Pascal 的 `chmcmd`（`packages/chm`
-内含 `paslzxcomp` 的 LZX 实现）。`build_chm.py --compiler auto`（`build.sh` 默认）
-固定使用 `chmcmd`；缺少工具时构建会提前报错。内置打包器仅供显式指定
-`--compiler builtin` 的开发调试使用。
+**做法**：压缩模式复用 Free Pascal 的 `chmcmd`（`packages/chm` 内含
+`paslzxcomp` 的 LZX 实现）。`build_chm.py --compiler auto`（`build.sh` 默认）检测到
+`chmcmd` 时使用 LZX；缺少工具时自动回退到内置未压缩打包器。只有显式指定
+`--compiler chmcmd` 才会在工具缺失时报错。
 
 | 产物 | 内置打包器（未压缩） | `chmcmd`（LZX） | 降幅 |
 | --- | --- | --- | --- |

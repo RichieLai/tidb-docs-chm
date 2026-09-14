@@ -15,7 +15,7 @@
 
 ### Windows 直接打开兼容性
 
-- 使用 Free Pascal `chmcmd` 生成 LZX 压缩 CHM。
+- 默认检测 Free Pascal `chmcmd`：存在时生成 LZX 压缩 CHM，缺少时自动使用内置未压缩打包器。
 - 正文 HTML 和 CSS 使用 UTF-8 BOM。
 - `toc.hhc` 使用 GBK，适配简体中文 Windows 的 HTML Help 解析器。
 - 使用一个传统 `toc.hhc` 目录；不创建自定义 `#WINDOWS` 窗口。
@@ -50,7 +50,7 @@
 - macOS 或 Linux
 - Python 3.9+
 - Git
-- Free Pascal 的 `chmcmd` 和 `chmls`
+- 可选：Free Pascal 的 `chmcmd` 和 `chmls`，用于 LZX 压缩和独立解包校验
 - 含图片版需要 Pillow，`build.sh` 会自动安装
 - 可选：7-Zip，用于额外执行 CHM 完整性检查
 
@@ -60,8 +60,9 @@ macOS 可安装 Free Pascal：
 brew install fpc
 ```
 
-`chmcmd` 是默认构建所必需的工具。`--no-compress` 会启用项目自带的未压缩写入器，
-只用于开发调试，不作为 Windows 直接打开兼容版的交付方式。
+默认 `--compiler=auto`：找到 `chmcmd` 就生成 LZX 压缩版，找不到则自动改用项目
+内置打包器，构建不会中断，但 CHM 体积会更大。`--compiler=chmcmd` 表示强制压缩，
+缺少工具时才会报错；`--no-compress` 等同 `--compiler=builtin`。
 
 ## 一键构建
 
@@ -158,7 +159,7 @@ python3 tools/build_chm.py \
 | `--sections` | 只生成指定顶层章节 |
 | `--images` | 打包图片；省略时生成纯文字版 |
 | `--image-profile` | `compact`、`tiny` 或 `original` |
-| `--compiler` | 默认 `auto`，等同经过验证的 `chmcmd`；`builtin` 仅用于调试 |
+| `--compiler` | `auto`（默认）= 有 `chmcmd` 就做 LZX 压缩，否则内置打包；`builtin` = 内置未压缩；`chmcmd` = 强制压缩，缺少时报错 |
 | `--prune` | `chm` 只留 CHM；`hhp` 另留 HHP/HHC；`none` 保留全部中间文件 |
 | `--limit` | 限制文章数量，用于快速试跑 |
 

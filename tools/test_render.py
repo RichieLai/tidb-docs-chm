@@ -230,6 +230,13 @@ def cases() -> bool:
                 ("目标文件名固定", 'tidb-docs-7.5.chm' in launcher),
                 ("调用系统解除锁定命令", "Unblock-File -LiteralPath $env:CHM_FILE" in launcher),
                 ("解除后打开 CHM", 'start "" "%CHM_FILE%"' in launcher))
+
+    # 21. auto 优先压缩，但缺少 chmcmd 时必须能离线回退构建。
+    ok &= check("打包器自动选择", "正文",
+                ("有 chmcmd 时压缩", B.choose_compiler("auto", True) == "chmcmd"),
+                ("缺少时回退内置", B.choose_compiler("auto", False) == "builtin"),
+                ("强制模式不改变", B.choose_compiler("chmcmd", False) == "chmcmd"
+                 and B.choose_compiler("builtin", True) == "builtin"))
     return ok
 
 

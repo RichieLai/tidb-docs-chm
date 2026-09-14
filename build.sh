@@ -9,11 +9,11 @@
 #   ./build.sh --no-images    # 只出无图版
 #   ./build.sh --images --image-profile original   # 含图片但保留原图
 #   ./build.sh --keep-html    # 额外保留 HTML 版与 hhc/hhp 工程文件
-#   ./build.sh --no-compress  # 仅调试：改用未压缩的内置打包器
+#   ./build.sh --no-compress  # 强制使用未压缩的内置打包器
 #
 # 产物默认保留 CHM 和首次打开脚本；HTML/工程文件构建成功后自动清理。
 # 含图片版默认同时做两层压缩：图片 compact 档（宽≤1200 + PNG 256 色）+ CHM LZX。
-# 默认必须用 FPC 的 chmcmd，生成已经过 Windows hh.exe 验证的直接打开兼容结构。
+# 默认优先用 FPC chmcmd 做 LZX 压缩；未安装时自动使用内置未压缩打包器。
 # 幂等可重复执行：venv、源码仓库、产物均自动准备/更新。
 set -euo pipefail
 
@@ -30,7 +30,8 @@ HAS_PROFILE=0
 PRUNE="chm"
 COMPILER="auto"
 IMAGE_ARGS=()
-for arg in "$@"; do
+while [ "$#" -gt 0 ]; do
+    arg="$1"
     case "$arg" in
         --images|--keep-images)
             BUILD_MODE="images"
@@ -40,6 +41,14 @@ for arg in "$@"; do
             ;;
         --compiler=*)
             COMPILER="${arg#--compiler=}"
+            ;;
+        --compiler)
+            if [ "$#" -lt 2 ]; then
+                echo "--compiler 需要 auto、builtin 或 chmcmd" >&2
+                exit 2
+            fi
+            COMPILER="$2"
+            shift
             ;;
         --no-compress)
             COMPILER="builtin"
@@ -60,18 +69,41 @@ for arg in "$@"; do
             HAS_PROFILE=1
             IMAGE_ARGS+=("$arg")
             ;;
+        --image-profile)
+            if [ "$#" -lt 2 ]; then
+                echo "--image-profile 需要 compact、tiny 或 original" >&2
+                exit 2
+            fi
+            HAS_PROFILE=1
+            IMAGE_ARGS+=("--image-profile=$2")
+            shift
+            ;;
         --image-max-width=*|--image-colors=*|--image-jpeg-quality=*)
             IMAGE_ARGS+=("$arg")
             ;;
+        --image-max-width|--image-colors|--image-jpeg-quality)
+            if [ "$#" -lt 2 ]; then
+                echo "$arg 需要一个数值" >&2
+                exit 2
+            fi
+            IMAGE_ARGS+=("$arg=$2")
+            shift
+            ;;
         --*)
-            echo "未知参数：${arg}（支持 --images、--image-*、--keep-html、--keep-hhp、--no-compress）" >&2
+            echo "未知参数：${arg}（参数说明见 README.md）" >&2
             exit 2
             ;;
         *)
             REF="$arg"
             ;;
     esac
+    shift
 done
+
+case "$COMPILER" in
+    auto|builtin|chmcmd) ;;
+    *) echo "无效打包器：$COMPILER（应为 auto、builtin 或 chmcmd）" >&2; exit 2 ;;
+esac
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
@@ -88,17 +120,20 @@ if [ ! -x "$PY" ]; then
 fi
 if ! "$PY" -c "import markdown" 2>/dev/null; then
     log "安装依赖 markdown"
-    "$VENV/bin/pip" install --quiet markdown
+    PIP_DISABLE_PIP_VERSION_CHECK=1 "$PY" -m pip install --quiet markdown
 fi
 if [ "$BUILD_MODE" != "plain" ] && ! "$PY" -c "import PIL" 2>/dev/null; then
     log "安装依赖 pillow（图片压缩用）"
-    "$VENV/bin/pip" install --quiet pillow
+    PIP_DISABLE_PIP_VERSION_CHECK=1 "$PY" -m pip install --quiet pillow
 fi
 
-if { [ "$COMPILER" = "auto" ] || [ "$COMPILER" = "chmcmd" ]; } && ! command -v chmcmd >/dev/null 2>&1; then
+if [ "$COMPILER" = "chmcmd" ] && ! command -v chmcmd >/dev/null 2>&1; then
     echo "缺少 chmcmd。请先安装 Free Pascal（macOS: brew install fpc），" >&2
-    echo "再重新运行 ./build.sh。--no-compress 仅用于开发调试。" >&2
+    echo "或改用 --compiler=auto / --no-compress。" >&2
     exit 1
+fi
+if [ "$COMPILER" = "auto" ] && ! command -v chmcmd >/dev/null 2>&1; then
+    log "未找到 chmcmd，自动使用内置未压缩打包器"
 fi
 
 # ---------------------------------------------------------------- 2. 源仓库

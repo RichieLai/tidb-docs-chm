@@ -1067,6 +1067,13 @@ def build_hhp(title: str, chm_name: str, files: list[str], lang: str = "en") -> 
     return "\n".join(lines)
 
 
+def choose_compiler(requested: str, chmcmd_available: bool) -> str:
+    """Resolve auto to chmcmd when installed, otherwise the builtin writer."""
+    if requested == "auto":
+        return "chmcmd" if chmcmd_available else "builtin"
+    return requested
+
+
 def to_chm_toc(entries: list[TocEntry]) -> list[TocNode]:
     nodes: list[TocNode] = []
     for e in entries:
@@ -1092,8 +1099,8 @@ def main() -> int:
                          "hhp=只留 *.chm + docs.hhp/toc.hhc（Windows 重编用）；"
                          "chm=只留 *.chm")
     ap.add_argument("--compiler", default="auto", choices=["auto", "builtin", "chmcmd"],
-                    help="打包器：auto/chmcmd=使用 FPC chmcmd 生成已验证的直接打开兼容版；"
-                         "builtin=仅供开发调试的未压缩内置打包器")
+                    help="打包器：auto=有 chmcmd 时用 LZX 压缩，否则自动用内置打包器；"
+                         "builtin=内置未压缩；chmcmd=强制使用，缺少时报错")
     ap.add_argument("--image-profile", default="compact",
                     choices=sorted(IMAGE_PROFILES),
                     help="图片压缩档位：compact=宽≤1200 + PNG 256 色（默认）；"
@@ -1289,12 +1296,13 @@ def main() -> int:
     print("[5/6] 打包 CHM")
     chm_path = os.path.join(out, args.chm)
     chm_files = [f for f in file_list if f not in skip_in_chm]
-    compiler = args.compiler
-    if compiler == "auto":
-        compiler = "chmcmd"
-    if compiler == "chmcmd" and not shutil.which("chmcmd"):
+    has_chmcmd = shutil.which("chmcmd") is not None
+    compiler = choose_compiler(args.compiler, has_chmcmd)
+    if args.compiler == "auto" and compiler == "builtin":
+        print("      未找到 chmcmd：auto 自动改用内置未压缩打包器")
+    if compiler == "chmcmd" and not has_chmcmd:
         print("      找不到 chmcmd（Free Pascal 的 CHM 编译器）："
-              "brew install fpc，或改用 --compiler builtin", file=sys.stderr)
+              "brew install fpc，或改用 --compiler auto / builtin", file=sys.stderr)
         return 1
 
     chmcmd_hhp = ""
