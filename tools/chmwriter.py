@@ -414,28 +414,30 @@ class ChmWriter:
         for entry in entries:
             size = len(enc_int(len(entry[0]))) + len(entry[0]) + len(enc_int(entry[1])) \
                 + len(enc_int(entry[2])) + len(enc_int(entry[3]))
-            # 预留 quickref：每 4 个条目 2 字节 + 2 字节计数
+            # quickref 每 5 个条目写一个相对偏移，末尾另有 2 字节条目数。
             cur = pmgl_index[-1]
             used = 20 + sum(self._entry_size(e) for e in cur) + size
-            quickref = 2 * ((len(cur) + 1 + 3) // 4) + 2
+            quickref = 2 * ((len(cur) + 1) // 5) + 2
             if used + quickref > BLOCK_SIZE and cur:
                 pmgl_index.append([entry])
             else:
                 cur.append(entry)
 
-        # 始终生成一层 PMGI 索引块，与 HTML Help Workshop 的习惯一致
+        # 单个 PMGL 块时，Windows 要求 depth=1/root=-1，不应额外生成 PMGI。
+        # 多块时才生成一层 PMGI 根索引；本项目的条目数量不会使 PMGI 溢出。
         pmgi_chunks: list[bytes] = []
-        pmgi_items = []
-        for i, chunk_entries in enumerate(pmgl_index):
-            pmgi_items.append((chunk_entries[0][0], i))
-        pmgi_chunks.append(self._pmgi_chunk(pmgi_items))
+        if len(pmgl_index) > 1:
+            pmgi_items = []
+            for i, chunk_entries in enumerate(pmgl_index):
+                pmgi_items.append((chunk_entries[0][0], i))
+            pmgi_chunks.append(self._pmgi_chunk(pmgi_items))
 
         for i, chunk_entries in enumerate(pmgl_index):
             chunks.append(self._pmgl_chunk(chunk_entries, i, len(pmgl_index)))
 
         all_chunks = chunks + pmgi_chunks
-        index_root = len(chunks)          # PMGI 块位于 PMGL 之后
-        index_depth = 2
+        index_root = len(chunks) if pmgi_chunks else -1
+        index_depth = 2 if pmgi_chunks else 1
 
         itsp = bytearray()
         itsp.extend(b"ITSP")
@@ -445,7 +447,7 @@ class ChmWriter:
         itsp.extend(_u32(BLOCK_SIZE))             # block length
         itsp.extend(_u32(2))                      # density / blockidx interval
         itsp.extend(_u32(index_depth))            # index depth
-        itsp.extend(_u32(index_root & 0xFFFFFFFF))
+        itsp.extend(_i32(index_root))
         itsp.extend(_u32(0))                         # 首个 PMGL 块
         itsp.extend(_u32(len(pmgl_index) - 1))       # 最后一个 PMGL 块
         itsp.extend(_u32(0xFFFFFFFF))                # unknown
@@ -476,20 +478,22 @@ class ChmWriter:
         body = bytearray()
         offsets: list[int] = []
         for name, section, offset, length in entries:
-            offsets.append(20 + len(body))
+            # quickref 偏移以 PMGL 头部之后为起点，不是块的绝对偏移。
+            offsets.append(len(body))
             body.extend(enc_int(len(name)))
             body.extend(name.encode("utf-8"))
             body.extend(enc_int(section))
             body.extend(enc_int(offset))
             body.extend(enc_int(length))
 
-        # quickref 区：块末尾，每 4 个条目一个 WORD 偏移，最后 2 字节为条目数
-        nqr = (len(entries) + 3) // 4
+        # quickref 区：第 5、10、15...个条目的 WORD 偏移，倒序置于块尾；
+        # 最后 2 字节是条目总数。Windows hh.exe 会严格校验这一布局。
+        nqr = len(entries) // 5
         quickref_len = 2 * nqr + 2
         quickref = bytearray(quickref_len)
         struct.pack_into("<H", quickref, quickref_len - 2, len(entries))
         for i in range(nqr):
-            struct.pack_into("<H", quickref, quickref_len - 4 - 2 * i, offsets[i * 4])
+            struct.pack_into("<H", quickref, quickref_len - 4 - 2 * i, offsets[i * 5 + 4])
 
         header = bytearray()
         header.extend(b"PMGL")
@@ -509,17 +513,17 @@ class ChmWriter:
         body = bytearray()
         offsets: list[int] = []
         for name, block in items:
-            offsets.append(8 + len(body))
+            offsets.append(len(body))
             body.extend(enc_int(len(name)))
             body.extend(name.encode("utf-8"))
             body.extend(enc_int(block))
 
-        nqr = (len(items) + 3) // 4
+        nqr = len(items) // 5
         quickref_len = 2 * nqr + 2
         quickref = bytearray(quickref_len)
         struct.pack_into("<H", quickref, quickref_len - 2, len(items))
         for i in range(nqr):
-            struct.pack_into("<H", quickref, quickref_len - 4 - 2 * i, offsets[i * 4])
+            struct.pack_into("<H", quickref, quickref_len - 4 - 2 * i, offsets[i * 5 + 4])
 
         header = bytearray()
         header.extend(b"PMGI")
@@ -699,3 +703,69 @@ class ChmReader:
             and data_offset == directory_offset + directory_len
             and data_offset <= len(d)
         )
+
+    def windows_directory_ok(self) -> bool:
+        """Strictly validate PMGL/PMGI quickrefs as Windows hh.exe expects them."""
+        d = self.data
+        p = self.dir_offset
+        if d[p:p + 4] != b"ITSP" or self.block_len != BLOCK_SIZE:
+            return False
+        depth = struct.unpack_from("<I", d, p + 0x18)[0]
+        root = struct.unpack_from("<I", d, p + 0x1C)[0]
+        first = struct.unpack_from("<I", d, p + 0x20)[0]
+        last = struct.unpack_from("<I", d, p + 0x24)[0]
+        base = p + 0x54
+        pmgl_indexes: list[int] = []
+        pmgi_indexes: list[int] = []
+
+        for block_index in range(self.num_blocks):
+            off = base + block_index * self.block_len
+            sig = d[off:off + 4]
+            if sig == b"PMGL":
+                header_size = 20
+                pmgl_indexes.append(block_index)
+            elif sig == b"PMGI":
+                header_size = 8
+                pmgi_indexes.append(block_index)
+            else:
+                return False
+
+            free_space = struct.unpack_from("<I", d, off + 4)[0]
+            entry_end = off + self.block_len - free_space
+            block_end = off + self.block_len
+            if not (off + header_size <= entry_end <= block_end - 2):
+                return False
+            item_count = struct.unpack_from("<H", d, block_end - 2)[0]
+            pos = off + header_size
+            starts: list[int] = []
+            try:
+                for _ in range(item_count):
+                    starts.append(pos - (off + header_size))
+                    name_len, pos = self._read_enc_int(d, pos)
+                    pos += name_len
+                    if sig == b"PMGL":
+                        _, pos = self._read_enc_int(d, pos)  # section
+                        _, pos = self._read_enc_int(d, pos)  # offset
+                        _, pos = self._read_enc_int(d, pos)  # length
+                    else:
+                        _, pos = self._read_enc_int(d, pos)  # child block
+            except (IndexError, struct.error):
+                return False
+            if pos != entry_end:
+                return False
+
+            # FPC/Microsoft layout stores the 5th, 10th, ... entry offsets in
+            # reverse order immediately before the item-count word.
+            for q, entry_index in enumerate(range(4, item_count, 5)):
+                actual = struct.unpack_from("<H", d, block_end - 4 - q * 2)[0]
+                if actual != starts[entry_index]:
+                    return False
+
+        # Some established writers (including chmcmd) set FirstPMGL to the
+        # second block while the previous/next chain still begins at block 0;
+        # hh.exe accepts both. The pointers must at least reference PMGL blocks.
+        if not pmgl_indexes or first not in pmgl_indexes or last not in pmgl_indexes:
+            return False
+        if len(pmgl_indexes) == 1:
+            return depth == 1 and root == 0xFFFFFFFF and not pmgi_indexes
+        return depth == 2 and len(pmgi_indexes) == 1 and root == pmgi_indexes[0]

@@ -152,6 +152,11 @@ def main() -> int:
         ok = False
         print("  [失败] 必须按 Section 0 -> ITSP 目录 -> 正文顺序写入，"
               "否则 hh.exe 会报 mk:@MSITStore 无法打开")
+    directory_ok = reader.windows_directory_ok()
+    print(f"目录块布局: {'Windows PMGL/PMGI 规范' if directory_ok else 'quickref 或根索引错误'}")
+    if not directory_ok:
+        ok = False
+        print("  [失败] PMGL/PMGI 每 5 项 quickref、相对偏移或根索引不符合 hh.exe 要求")
     try:
         system = reader.read("/#SYSTEM")
     except KeyError:

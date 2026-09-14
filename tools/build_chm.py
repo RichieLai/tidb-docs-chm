@@ -1346,6 +1346,12 @@ def main() -> int:
         print("      [失败] Section 0、ITSP 目录和正文数据的偏移不符合 hh.exe 要求",
               file=sys.stderr)
         return 1
+    directory_ok = reader.windows_directory_ok()
+    print(f"      Windows PMGL/PMGI 目录块校验 {'OK' if directory_ok else '失败'}")
+    if not directory_ok:
+        print("      [失败] 目录块 quickref、层级或根索引不符合 hh.exe 要求",
+              file=sys.stderr)
+        return 1
     expect = {"/" + n for n in file_list if n not in skip_in_chm} | {"/#SYSTEM"}
     binary_toc_required = {"/#TOCIDX", "/#TOPICS", "/#STRINGS", "/#URLTBL", "/#URLSTR"}
     expect |= binary_toc_required

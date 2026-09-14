@@ -264,6 +264,8 @@ def cases() -> bool:
                      and binary[directory_offset:directory_offset + 4] == b"ITSP"),
                     ("正文位于目录之后", data_offset == directory_offset + directory_len))
         reader = ChmReader(path)
+        ok &= check("Windows CHM 目录块布局", "正文",
+                    ("PMGL quickref 与根索引有效", reader.windows_directory_ok()))
         binary_toc = {"/#TOCIDX", "/#TOPICS", "/#STRINGS", "/#URLTBL", "/#URLSTR"}
         system_records = {}
         system = reader.read("/#SYSTEM")
