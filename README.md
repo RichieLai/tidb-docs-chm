@@ -1,91 +1,163 @@
 # TiDB 中文文档离线 CHM 生成工具
 
 把 TiDB 官方中文文档仓库 [`pingcap/docs-cn`](https://github.com/pingcap/docs-cn)
-打包为可以在 Windows `hh.exe` 中直接打开的单文件 CHM。构建在 macOS 或 Linux
+打包成可在 Windows `hh.exe` 中直接打开的单文件 CHM。构建过程在 macOS 或 Linux
 完成，不依赖 Microsoft HTML Help Workshop。
 
 默认一次生成两个版本：
 
-- **纯文字版**：去掉图片和视频，体积最小，完全离线显示正文。
-- **压缩图片版**：图片随 CHM 离线打包，默认缩放并量化，兼顾清晰度和体积。
+- **纯文字版**：去掉图片和视频，体积最小，正文可完全离线显示。
+- **压缩图片版**：把图片一同打进 CHM，默认缩放并量化，在清晰度和体积之间取平衡。
 
-### 离线与内容清理
+当前生成规则已经针对 Windows HTML Help 的打开兼容性、中文编码、目录层级、离线资源、
+正文间距、列表序号、表格和标题样式做过完整校验。构建成功后，`dist/` 默认只保留 CHM。
 
-- 所有正文、样式和选择保留的图片都打进 CHM，不依赖网络资源才能显示。
-- 删除视频、iframe 和网页播放器。
-- 删除 `{{< copyable "shell-regular" >}}` 等 Hugo 网页短代码。
-- 删除 `[TOC]`、`.toc` 和 `.nav` 形式的文章开头重复导航；左侧 CHM 目录仍保留。
-- 同版本站内链接优先改为 CHM 内链；跨版本、未收录内容和外部参考保留为普通外链。
-- 标题锚点保留中文并与官网规则一致；重复标题使用 `-1`、`-2` 后缀。
-- 生成独立的 `license.html`，保留来源和 CC BY-SA 3.0 说明。
+> **English summary:** `tidb-docs-chm` builds self-contained CHM files from the
+> official Chinese TiDB documentation repository. It includes a pure-Python CHM
+> writer, optional LZX compression through Free Pascal `chmcmd`, UTF-8 BOM pages,
+> Windows binary TOC data, offline link rewriting, and optional image compression.
+> Project code is MIT licensed. Bundled TiDB documentation remains CC BY-SA 3.0.
 
-### 当前正文版式
+## 1. 项目目录结构
 
-- 页面宽度和边距适配 Windows HTML Help，列表不会出现过大的左侧空白。
-- 段落、代码块、引用块及表格采用紧凑间距。
-- 宽表格放入可横向滚动的容器；表格单元格内进一步压缩间距。
-- 标题层级清楚；标题中的代码名称继承标题字号，不会缩成正文代码大小。
-- 一级有序列表显示 `1, 2, 3`，二级显示 `a, b, c`，三级显示 `i, ii, iii`；
-  同时写入 CSS 和 HTML `type` 属性，以兼容旧版 CHM 渲染器。
-- 原文的 `start` 起始序号保持不变。
+```text
+tidb-docs-chm/
+├── build.sh                 一键构建入口，自动准备环境、源码、产物和校验
+├── Makefile                 build / plain / images / test / verify 等快捷命令
+├── tools/
+│   ├── build_chm.py         TOC 解析、Markdown 清洗、链接转换、HTML 和 CHM 流水线
+│   ├── chmwriter.py         内置 CHM 写入器、二进制目录生成器和只读解析器
+│   ├── test_render.py       渲染规则测试与全量 Markdown 语料扫描
+│   └── verify_chm.py        CHM 结构、目录、编码、资源、链接和版式自检
+├── docs/
+│   ├── verification.md      兼容性与版式问题的验收记录
+│   └── screenshots/         目录、编码、压缩和排版验收截图
+├── repos/
+│   └── docs-cn/             官方文档仓库，由 build.sh 自动克隆或更新，不提交
+├── dist/                    构建产物，不提交
+├── .venv/                   Python 虚拟环境，由 build.sh 自动创建，不提交
+├── .gitignore
+└── LICENSE
+```
 
-## 环境要求
+仓库只提交构建工具与说明文档。官方文档源码、虚拟环境、HTML 中间文件和 CHM 成品都可
+重新生成，因此不进入 Git 仓库。
+
+## 2. 环境要求
+
+### 2.1 必需环境
 
 - macOS 或 Linux
-- Python 3.9+
+- Python 3.9 或更高版本
 - Git
-- 可选：Free Pascal 的 `chmcmd` 和 `chmls`，用于 LZX 压缩和独立解包校验
-- 含图片版需要 Pillow，`build.sh` 会自动安装
-- 可选：7-Zip，用于额外执行 CHM 完整性检查
+- 可访问 GitHub，用于首次克隆和后续更新 `pingcap/docs-cn`
 
-macOS 可安装 Free Pascal：
+`build.sh` 会自动创建 `.venv`，并按需要安装：
+
+- `markdown`：Markdown 转 HTML。
+- `pillow`：含图片版的缩放、PNG 调色板量化和 JPEG 重编码。
+
+### 2.2 可选工具
+
+| 工具 | 用途 | 未安装时的行为 |
+| --- | --- | --- |
+| Free Pascal `chmcmd` | 生成 LZX 压缩 CHM | `--compiler=auto` 自动改用内置未压缩打包器 |
+| Free Pascal `chmls` | 解包 LZX CHM，与打包输入逐字节核对 | 跳过该项独立解包核对 |
+| 7-Zip `7zz` | 对成品执行额外完整性测试 | 自动跳过，不影响构建 |
+| Pillow | 压缩图片 | `build.sh` 自动安装；手动构建时 macOS 可退回 `sips` 做有限缩放 |
+
+macOS 安装 Free Pascal：
 
 ```bash
 brew install fpc
 ```
 
-默认 `--compiler=auto`：找到 `chmcmd` 就生成 LZX 压缩版，找不到则自动改用项目
-内置打包器，构建不会中断，但 CHM 体积会更大。`--compiler=chmcmd` 表示强制压缩，
-缺少工具时才会报错；`--no-compress` 等同 `--compiler=builtin`。
+安装后，`chmcmd` 和 `chmls` 应能从 `PATH` 中找到。默认 `auto` 模式检测到
+`chmcmd` 就生成 LZX 压缩版；找不到时构建仍会完成，但文件会更大。
 
-## 一键构建
+## 3. 一键构建
+
+### 3.1 首次构建
 
 ```bash
 git clone https://github.com/RichieLai/tidb-docs-chm.git
 cd tidb-docs-chm
 
-# 默认：最新版纯文字版 + 压缩图片版
+# 默认构建最新版：纯文字版 + 压缩图片版
 ./build.sh
+```
 
-# 指定 TiDB 版本
+脚本会依次完成：
+
+1. 创建或复用 `.venv`，安装必要的 Python 依赖。
+2. 首次运行时把官方文档克隆到 `repos/docs-cn`。
+3. 更新并切换到指定分支的最新提交。
+4. 解析官方 `TOC.md`，转换全部文档和本地链接。
+5. 生成纯文字版、含图片版，或用户指定的单一版本。
+6. 有 `chmcmd` 时执行 LZX 压缩，否则使用内置打包器。
+7. 有 `7zz` 时执行额外完整性测试，再运行 `tools/verify_chm.py`。
+8. 按保留策略清理中间文件并打印最终路径。
+
+### 3.2 常用示例
+
+```bash
+# 指定 TiDB 版本；分支名原样传入
 ./build.sh release-7.5
 
 # 只生成纯文字版
 ./build.sh release-7.5 --no-images
 
-# 只生成压缩图片版
+# 只生成含图片版，默认 compact 图片压缩档
 ./build.sh release-7.5 --images
+
+# 含图片版保留原图
+./build.sh release-7.5 --images --image-profile=original
+
+# 使用更小的图片压缩档
+./build.sh release-7.5 --images --image-profile=tiny
+
+# 强制使用内置未压缩打包器
+./build.sh release-7.5 --no-compress
+
+# 强制使用 chmcmd；没有安装时直接报错
+./build.sh release-7.5 --compress
+
+# 保留全部 HTML、预览页和工程文件
+./build.sh release-7.5 --keep-html
+
+# 只额外保留 Windows 重编所需的 HHP/HHC
+./build.sh release-7.5 --keep-hhp
 ```
 
-指定版本后的产物示例：
-
-```text
-dist/tidb-docs-7.5/tidb-docs-7.5.chm
-dist/tidb-docs-7.5-images/tidb-docs-7.5-images.chm
-```
-
-## 图片压缩
-
-含图片版默认使用 `compact`：图片最大宽度 1200 像素、PNG 量化为 256 色、JPEG
-质量 82。压缩后变大的文件会自动保留原图。
+查看官方仓库当前可用的版本分支：
 
 ```bash
-./build.sh release-7.5 --images --image-profile=compact
-./build.sh release-7.5 --images --image-profile=tiny
-./build.sh release-7.5 --images --image-profile=original
+git ls-remote --heads https://github.com/pingcap/docs-cn.git "release-*"
 ```
 
-也可以单独覆盖参数：
+### 3.3 `build.sh` 完整参数
+
+`build.sh` 是推荐入口。版本分支是位置参数，其余选项可放在版本参数前后。
+
+| 参数 | 别名 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `release-x.y` | 无 | `master` | 文档分支，例如 `release-7.5`、`release-8.5` |
+| `--images` | `--keep-images` | 默认两版 | 只生成含图片版 |
+| `--no-images` | `--plain` | 默认两版 | 只生成纯文字版 |
+| `--compiler=auto` | `--compiler auto` | `auto` | 有 `chmcmd` 时 LZX 压缩，否则用内置打包器 |
+| `--compiler=builtin` | `--no-compress` | 无 | 强制使用内置未压缩打包器 |
+| `--compiler=chmcmd` | `--compress` | 无 | 强制使用 `chmcmd`；工具缺失时构建失败 |
+| `--keep-html` | `--keep-all` | 无 | 对应 `--prune=none`，保留所有 HTML 和工程文件 |
+| `--keep-hhp` | 无 | 无 | 对应 `--prune=hhp`，保留 CHM、`docs.hhp` 和 `toc.hhc` |
+| `--only-chm` | `--prune-chm` | 开启 | 对应 `--prune=chm`，只保留 CHM |
+| `--image-profile=compact` | 可用空格传值 | `compact` | 图片最大宽 1200、PNG 256 色、JPEG 质量 82 |
+| `--image-profile=tiny` | 可用空格传值 | 无 | 图片最大宽 1000、PNG 128 色、JPEG 质量 78 |
+| `--image-profile=original` | 可用空格传值 | 无 | 原图入库，不主动重编码 |
+| `--image-max-width=N` | 可用空格传值 | 取档位值 | 覆盖最大宽度；`0` 表示不缩放 |
+| `--image-colors=N` | 可用空格传值 | 取档位值 | 覆盖 PNG 调色板色数；`0` 表示保持真彩 |
+| `--image-jpeg-quality=N` | 可用空格传值 | 取档位值 | 覆盖 JPEG 质量；`0` 表示不重编码 |
+
+参数组合示例：
 
 ```bash
 ./build.sh release-7.5 --images \
@@ -94,77 +166,283 @@ dist/tidb-docs-7.5-images/tidb-docs-7.5-images.chm
   --image-jpeg-quality=80
 ```
 
-## 手动构建
+## 4. 输出目录和文件保留策略
 
-```bash
-python3 tools/build_chm.py \
-  --repo repos/docs-cn \
-  --out dist/tidb-docs-7.5 \
-  --title "TiDB v7.5 中文文档" \
-  --chm tidb-docs-7.5.chm \
-  --ref release-7.5 --all --lang zh --compiler chmcmd
+### 4.1 输出命名
+
+`master` 默认产物：
+
+```text
+dist/tidb-docs-cn/tidb-docs-cn.chm
+dist/tidb-docs-cn-images/tidb-docs-cn-images.chm
 ```
 
-常用参数：
+指定 `release-7.5` 后：
 
-| 参数 | 说明 |
+```text
+dist/tidb-docs-7.5/tidb-docs-7.5.chm
+dist/tidb-docs-7.5-images/tidb-docs-7.5-images.chm
+```
+
+项目不会生成额外的 Windows 启动脚本。最终 CHM 可直接复制到 Windows 使用。
+
+### 4.2 清理策略
+
+`build.sh` 默认选择 `chm`；直接调用 `build_chm.py` 时默认选择 `none`。
+
+| `--prune` 值 | 最终保留 | 适用场景 |
+| --- | --- | --- |
+| `chm` | 仅 `*.chm` | 日常构建和分发 |
+| `hhp` | `*.chm`、`docs.hhp`、`toc.hhc` | 在 Windows 使用 `hhc.exe` 重编 |
+| `none` | CHM、HTML、CSS、预览页和工程文件 | 检查排版或调试链接 |
+
+主要文件说明：
+
+| 文件 | 用途 |
 | --- | --- |
-| `--repo` | `pingcap/docs-cn` 本地 Git 仓库 |
-| `--out` | 输出目录 |
-| `--ref` | 文档分支，例如 `release-7.5` |
-| `--all` | 收录 `TOC.md` 中全部章节 |
-| `--sections` | 只生成指定顶层章节 |
-| `--images` | 打包图片；省略时生成纯文字版 |
-| `--image-profile` | `compact`、`tiny` 或 `original` |
-| `--compiler` | `auto`（默认）= 有 `chmcmd` 就做 LZX 压缩，否则内置打包；`builtin` = 内置未压缩；`chmcmd` = 强制压缩，缺少时报错 |
-| `--prune` | `chm` 只留 CHM；`hhp` 另留 HHP/HHC；`none` 保留全部中间文件 |
-| `--limit` | 限制文章数量，用于快速试跑 |
+| `*.chm` | 完全自包含的离线文档本体 |
+| `docs.hhp` | HTML Help 工程；使用 `--keep-hhp` 或 `--keep-html` 时保留 |
+| `toc.hhc` | 传统目录源，已打入 CHM；保留后也可供 `hhc.exe` 重编 |
+| `index.html`、`p*.html`、`style.css` | CHM 的页面和样式输入；`--keep-html` 时保留 |
+| `preview.html` | 模拟左侧目录和右侧正文的浏览器预览页，不写入 CHM |
+| `license.html` | 文档来源与许可页，写入 CHM |
 
-## 校验
+## 5. 手动构建
 
-渲染回归测试：
+需要控制章节数、输出名称、语言或 BOM 时，可以直接调用构建流水线。
 
 ```bash
-make test
+# 最新版全量纯文字 CHM
+.venv/bin/python tools/build_chm.py \
+  --repo repos/docs-cn \
+  --out dist/tidb-docs-cn \
+  --title "TiDB 中文文档" \
+  --chm tidb-docs-cn.chm \
+  --all --lang zh --compiler auto --prune chm
+
+# 指定分支并生成含图片版
+.venv/bin/python tools/build_chm.py \
+  --repo repos/docs-cn \
+  --out dist/tidb-docs-7.5-images \
+  --title "TiDB 7.5 中文文档（含图片）" \
+  --chm tidb-docs-7.5-images.chm \
+  --ref release-7.5 --all --lang zh --images \
+  --image-profile compact --compiler chmcmd --prune chm
+
+# 只生成指定顶层章节
+.venv/bin/python tools/build_chm.py \
+  --repo repos/docs-cn \
+  --out dist/tidb-docs-sample \
+  --sections "快速上手,部署标准集群" \
+  --limit 50 --lang zh --compiler builtin
 ```
 
-成品自检：
+直接运行脚本时不会自动创建虚拟环境或安装依赖。通常应先运行一次 `build.sh`，再使用：
 
 ```bash
-python3 tools/verify_chm.py dist/tidb-docs-7.5/tidb-docs-7.5.chm
+.venv/bin/python tools/build_chm.py --help
+```
+
+## 6. `build_chm.py` 完整参数说明
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--repo DIR` | 必填 | 本地 `pingcap/docs-cn` 仓库路径；目录中应有可由 Git 读取的 `TOC.md` |
+| `--out DIR` | 必填 | HTML 中间文件、工程文件和最终 CHM 的输出目录 |
+| `--title TEXT` | `TiDB Documentation` | CHM 标题、封面标题和 `/#SYSTEM` 书名 |
+| `--chm FILE` | `tidb-docs.chm` | 输出 CHM 文件名 |
+| `--all` | 关闭 | 收录 `TOC.md` 中全部顶层章节 |
+| `--sections "A,B"` | 空 | 只收录名称完全匹配的顶层章节；未指定 `--all` 或本参数时只取前 3 个顶层章节 |
+| `--limit N` | `0` | 最多收录 N 篇文档；`0` 表示不限制，适合用小值快速试跑 |
+| `--images` | 关闭 | 打包文档引用的图片；别名为 `--keep-images` |
+| `--prune MODE` | `none` | `none` 保留全部；`hhp` 保留 CHM/HHP/HHC；`chm` 仅保留 CHM |
+| `--compiler MODE` | `auto` | `auto`、`builtin` 或 `chmcmd`，详见第 8 节 |
+| `--image-profile PROFILE` | `compact` | `original`、`compact` 或 `tiny`，详见第 7 节 |
+| `--image-max-width N` | 档位值 | 覆盖图片最大宽度；`0` 表示不缩放 |
+| `--image-colors N` | 档位值 | 覆盖 PNG 色数；`0` 表示保持真彩 |
+| `--image-jpeg-quality N` | 档位值 | 覆盖 JPEG 质量；`0` 表示不重编码 |
+| `--ref BRANCH` | 空 | 执行浅层 `fetch` 并切换到指定分支，例如 `release-7.5` |
+| `--toc-mode hhc\|binary` | `hhc` | 兼容旧命令的参数；当前两种取值都会同时生成 HHC 与 Windows 二进制目录 |
+| `--lang zh\|en` | `zh` | `zh` 使用 GBK 目录和语言 ID `0x0804`；`en` 使用英文语言设置 |
+| `--utf8-bom` | 开启 | 正文 HTML/CSS 写入 UTF-8 BOM，让阅读器默认按 UTF-8 解码 |
+| `--no-utf8-bom` | 关闭 | 不写 BOM，只依赖页面中的 `<meta charset>`；不建议用于中文 CHM |
+
+`--source-ref` 是 `build.sh` 内部使用的来源标记参数，用于封面、页脚和官网链接版本映射，
+不属于日常手动参数。它不会切换 Git 分支。
+
+## 7. 图片压缩说明
+
+文档图片以 UI 截图、监控面板和架构图为主。直接收入原图会明显增大 CHM，因此提供三档：
+
+| 档位 | 最大宽度 | PNG | JPEG | 适用场景 |
+| --- | ---: | --- | --- | --- |
+| `original` | 不缩放 | 不量化 | 不重编码 | 需要保留原始画质，接受较大文件 |
+| `compact`（默认） | 1200 px | 256 色 | 质量 82 | 截图文字清晰，兼顾体积 |
+| `tiny` | 1000 px | 128 色 | 质量 78 | 优先减小文件，小字号可能稍糊 |
+
+处理规则：
+
+- `.png`、`.jpg`、`.jpeg`、`.bmp`、`.tif`、`.tiff` 会按档位处理。
+- `.gif` 和 `.svg` 保持原格式。
+- PNG 使用降采样和调色板量化；透明图片先合成到白色背景。
+- JPEG 按指定质量重新编码。
+- 如果处理后的文件反而更大，自动保留原图。
+- `--image-colors=0` 可关闭 PNG 量化；`--image-max-width=0` 可关闭缩放。
+- 纯文字版移除图片标签或把裸媒体链接降级为文字，不留下缺失的本地图片引用。
+- 原始 Markdown 和原始图片不会被修改，所有处理只发生在输出目录。
+
+历史 v7.5 验收中，`compact` 档将图片资源从约 111 MB 降至约 28 MB。实际大小会随
+文档分支、图片数量、压缩器和参数变化，应以本次构建日志为准。
+
+## 8. CHM 打包与 LZX 压缩
+
+### 8.1 三种打包模式
+
+| 模式 | 行为 | 适用场景 |
+| --- | --- | --- |
+| `auto`（默认） | 找到 `chmcmd` 时生成 LZX 压缩包，否则使用内置打包器 | 推荐 |
+| `builtin` | 使用项目内置 ITSF 写入器，内容不做 LZX 压缩 | 无法安装 FPC、快速调试 |
+| `chmcmd` | 强制使用 Free Pascal `chmcmd`，缺少时立即报错 | 必须获得较小成品 |
+
+`build.sh --no-compress` 等同于 `--compiler=builtin`；`build.sh --compress` 等同于
+`--compiler=chmcmd`。
+
+### 8.2 实现与取舍
+
+- 内置写入器不依赖 Windows 或 FPC，生成合法的未压缩 ITSF CHM。
+- `chmcmd` 提供 LZX 压缩，主要压缩 HTML 文本；PNG/JPEG 本身已压缩，因此含图片版
+  的二次压缩收益通常小于纯文字版。
+- `chmcmd` 使用单独的临时 HHP 配置，关闭索引、全文搜索和 CHI 文件。
+- 两种打包器都包含传统 `toc.hhc` 和 Windows 二进制目录，最终导航规则一致。
+- 检测到 `chmls` 时，构建器会解包压缩 CHM，并把内容与打包输入逐字节比较。
+
+历史 v7.5 验收中，纯文字版由约 9.9 MB 压缩到约 2.5 MB，`compact` 含图片版由
+约 39.4 MB 压缩到约 30.7 MB。数据仅用于说明压缩量级。
+
+## 9. 编码与目录约定
+
+### 9.1 中文编码
+
+| CHM 内容 | 编码 | 原因 |
+| --- | --- | --- |
+| 正文 HTML | UTF-8 + BOM + `<meta charset>` | `hh.exe` 和第三方阅读器可直接判定 UTF-8 |
+| `style.css` | UTF-8 + BOM | 与正文一致，避免非 ASCII 内容误判 |
+| `toc.hhc` | GBK | 简体中文 Windows 的 HTML Help 按 ANSI 读取 |
+| `/#STRINGS` | GBK | Windows 二进制目录标题按活动代码页读取 |
+| `/#SYSTEM` | GBK | 书名、默认页和目录名按活动代码页读取 |
+| `docs.hhp` | GBK | Windows `hhc.exe` 按 ANSI 读取工程文件 |
+
+关闭 UTF-8 BOM 可能导致中文正文在默认编码下乱码，除非有明确测试需求，否则不要使用
+`--no-utf8-bom`。
+
+### 9.2 为什么同时包含两种目录
+
+传统 `toc.hhc` 适合第三方阅读器，并可供 Windows `hhc.exe` 重编；Windows 自带
+`hh.exe` 需要二进制目录流才能稳定显示原生左侧导航。当前构建器始终同时生成两者，
+并确保目录项都指向同一组短 ASCII 页面。
+
+`--toc-mode` 仅为兼容旧命令保留，`hhc` 和 `binary` 在当前版本不会改变最终目录组成。
+目录卫生依靠“不生成索引和全文数据库”保证，而不是删除 Windows 所需的二进制目录。
+
+## 10. Markdown、链接与资源处理
+
+| 源文档内容 | 构建结果 |
+| --- | --- |
+| `{{{ .company }}}` 等变量 | 使用仓库 `variables.json` 替换；未知标记被清理 |
+| `{{< copyable ... >}}` 等短代码 | 删除标记，保留其后的实际代码块 |
+| `<div label="macOS">`、`<details>` | 允许容器内 Markdown 正常渲染 |
+| 列表项内缩进的围栏代码 | 预处理成稳定的 `<pre><code>`，避免被解析为行内代码 |
+| 同版本且已收录的 `.md` 或官网链接 | 改为本地哈希 HTML，并保留有效锚点 |
+| 跨版本 TiDB 链接 | 保留原版本官网 URL，不错误映射到当前 CHM |
+| 未收录的 TiDB 页面 | 改为对应官网页面，避免留下无效本地链接 |
+| TiDB Cloud、Kubernetes、GitHub 等资料 | 保留外链 |
+| Markdown 图片和 HTML `<img>` | 含图片版下载或读取后写入本地资源；纯文字版移除显示依赖 |
+| 远程图片下载失败 | 降级为可读文本，不保留必须联网显示的 `<img>` |
+| 视频和播放器 | 删除，不写入 CHM |
+
+离线的含义是：正文和图片版中保留的图片无需联网即可显示。主动点击外部参考链接仍会尝试
+打开浏览器；这不会影响当前 CHM 页面离线阅读。
+
+## 11. 校验方法
+
+### 11.1 渲染回归测试
+
+```bash
+# 固定用例 + repos/docs-cn 全量 Markdown 扫描
+make test
+
+# 等价命令
+.venv/bin/python tools/test_render.py
+
+# 只跑固定用例，不扫描全部文档
+.venv/bin/python tools/test_render.py --fast
+```
+
+测试覆盖列表、嵌套代码块、引用块、HTML 容器、模板清理、图片语法、官网链接、标题锚点、
+有序列表类型，以及 Windows CHM 二进制布局和启动目录。
+
+### 11.2 成品自检
+
+```bash
+.venv/bin/python tools/verify_chm.py \
+  dist/tidb-docs-7.5/tidb-docs-7.5.chm
 ```
 
 校验器会检查：
 
-- `toc.hhc` 目录是否存在，目录链接是否完整；
-- 是否混入关键词索引或全文搜索数据库；
-- `/#SYSTEM` 是否明确把启动页和目录声明为 `index.html`、`toc.hhc`；
-- 所有 HTML 是否带 UTF-8 BOM；
-- 所有主题页是否使用短 ASCII 哈希文件名；
-- 是否残留 copyable 模板标记、页首导航或远程显示资源；
-- 所有有序列表是否明确写入数字、字母或罗马数字类型；
-- 所有本地 `href` 和 `src` 是否能在 CHM 中找到目标；
-- 所有带章节片段的内链是否能找到对应标题锚点；
-- LZX CHM 解包后的文件是否与打包前逐字节一致。
+- ITSF Section 0、ITSP、PMGL/PMGI 目录块和 Windows 启动目录是否有效。
+- `/#SYSTEM` 是否把启动页和传统目录声明为 `index.html`、`toc.hhc`。
+- `toc.hhc` 和五个 Windows 二进制目录流是否齐全。
+- 是否混入 `index.hhk`、关键词索引或全文搜索数据库。
+- 所有正文 HTML 是否带 UTF-8 BOM。
+- 所有主题页和本地资源是否使用短 ASCII 文件名。
+- 是否残留 Hugo 短代码、页首重复导航或必须联网显示的资源。
+- 所有本地 `href` 和 `src` 是否存在。
+- 带 `#fragment` 的本地链接能否找到对应标题锚点。
+- 有序列表是否明确写入数字、字母或罗马数字类型。
+- LZX 解包内容是否与打包输入一致。
 
-Windows 测试新版本前，请先关闭已经打开的同名 CHM，再覆盖文件并重新打开，避免
-HTML Help 使用旧窗口中的缓存内容。
+### 11.3 可选的独立工具检查
 
-## 项目结构
-
-```text
-build.sh                 一键构建入口
-Makefile                 build / images / test / verify 快捷命令
-tools/build_chm.py       Markdown 清洗、链接转换、版式和打包流水线
-tools/chmwriter.py       未压缩 CHM 写入器及只读解析器
-tools/test_render.py     渲染规则及全量语料回归测试
-tools/verify_chm.py      CHM 结构、离线资源、内链和版式自检
-docs/verification.md    验收规则和证据
-repos/docs-cn/           自动下载的官方文档仓库，不提交
-dist/                    构建产物，不提交
+```bash
+7zz t dist/tidb-docs-7.5/tidb-docs-7.5.chm
+7zz l dist/tidb-docs-7.5/tidb-docs-7.5.chm
+chmls extractall dist/tidb-docs-7.5/tidb-docs-7.5.chm /tmp/tidb-chm
 ```
 
-## 许可
+详细的问题现象、根因、修复和验收证据见
+[`docs/verification.md`](docs/verification.md)。
 
-- 本项目构建工具采用 MIT License。
-- TiDB 官方文档内容版权归 PingCAP 所有，采用 CC BY-SA 3.0。生成物会包含来源与许可说明。
+## 12. Makefile 快捷命令
+
+| 命令 | 等价行为 |
+| --- | --- |
+| `make help` | 显示快捷命令 |
+| `make build` | 运行 `./build.sh`，生成纯文字版和含图片版 |
+| `make plain` | 只生成纯文字版 |
+| `make images` | 只生成 `compact` 含图片版 |
+| `make test` | 执行渲染用例和全量语料扫描 |
+| `make verify` | 校验默认的两个 CHM；不存在的含图片版会跳过 |
+| `make preview` | 使用 `--keep-html` 构建并在 macOS 打开预览页 |
+| `make clean` | 删除整个 `dist/` 构建目录 |
+
+## 13. 已知限制
+
+- LZX 压缩依赖 Free Pascal `chmcmd`；未安装时只能生成未压缩 CHM。
+- 外部网站内容不会被镜像，外链在无网络环境中无法访问。
+- 不生成关键词索引和全文搜索数据库，以保证目录干净和跨阅读器兼容性。
+- macOS/Linux 无法原生运行 Windows `hh.exe`；代码通过二进制结构校验和 Windows 实机
+  验收保证兼容性。
+- 文档内容和图片压缩结果会随上游分支变化，历史体积与文件数量仅供参考。
+
+## 14. License 与来源说明
+
+- **本仓库代码**：`tools/`、`build.sh`、`Makefile` 等采用 MIT License，见
+  [`LICENSE`](LICENSE)。
+- **TiDB 文档内容**：来自 [`pingcap/docs-cn`](https://github.com/pingcap/docs-cn)，
+  版权归 PingCAP 所有，采用
+  [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/) 许可。
+- 生成的 CHM 会包含来源和许可页；分发时应保留署名与相同许可。
+- `docs/screenshots/` 是 TiDB 文档的渲染结果，同样按文档许可使用。
+- 本项目是第三方离线阅读工具，与 PingCAP 无隶属关系；文档内容以
+  [TiDB 官方文档](https://docs.pingcap.com/zh/tidb/stable/) 为准。
