@@ -176,7 +176,15 @@ TEMPLATE_VAR_RE = re.compile(r"\{\{\{\s*\.([A-Za-z0-9_-]+)\s*\}\}\}")
 SIMPLETAB_RE = re.compile(r"</?SimpleTab[^>]*>", re.I)
 DIV_LABEL_RE = re.compile(r'<div\s+[^>]*?\blabel="([^"]*)"[^>]*>', re.I)
 DETAILS_RE = re.compile(r"<details(\s+markdown=\"1\")?>", re.I)
-IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+# 图片的替代文字不能跨行。否则正文里的未闭合字面量（例如 ``/*T![``）
+# 会一直吞到后续普通链接的 ``](``，把文章链接误改成 m*.html 图片资源。
+IMAGE_RE = re.compile(r"!\[([^\]\n]*)\]\(([^)\s\n]+)(?:[ \t]+\"[^\"\n]*\")?\)")
+HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.I)
+HTML_IMG_SRC_RE = re.compile(r"\bsrc\s*=\s*([\"'])([^\"']+)\1", re.I)
+HTML_IMG_ALT_RE = re.compile(r"\balt\s*=\s*([\"'])([^\"']*)\1", re.I)
+DOCS_DOWNLOAD_IMAGE_RE = re.compile(
+    r"https?://docs-download\.pingcap\.com/media/images/docs-cn/(?P<path>[^?#]+)", re.I
+)
 # 链接文字里允许出现 [ ]（如 [`BATCH [ON COLUMN] LIMIT INTEGER DELETE`](/x.md)）
 MD_LINK_RE = re.compile(
     r"(?<!!)\[((?:[^\[\]\n]|\[[^\]\n]*\])*)\]\((/[^)\s]+\.md)(#[^)\s]*)?\)"
@@ -346,7 +354,8 @@ def build_link_index(doc_paths: list[str], raw_map: dict[str, str]) -> dict[str,
 def rewrite_links(text: str, keep_images: bool, stats: dict,
                   link_index: dict[str, str] | None = None,
                   included: set[str] | None = None,
-                  web_prefix: str = "") -> str:
+                  web_prefix: str = "",
+                  available_files: set[str] | None = None) -> str:
     """链接改写：
 
     - 指向**本 CHM 内**页面的 .md 链接 -> 本地 .html
@@ -413,6 +422,34 @@ def rewrite_links(text: str, keep_images: bool, stats: dict,
         return f'<p class="img-missing">[图片已省略] {label}</p>'
 
     text = IMAGE_RE.sub(image_sub, text)
+
+    # 少数新文档直接写远程 <img src="...">，Markdown 图片正则无法处理。
+    # 能在 docs-cn/media 中找到同名资源时改成本地短文件名；找不到时显示
+    # 离线占位说明，绝不让最终 CHM 的页面显示依赖网络。
+    def html_image_sub(m: re.Match) -> str:
+        tag = m.group(0)
+        src_match = HTML_IMG_SRC_RE.search(tag)
+        if not src_match:
+            return tag
+        src = src_match.group(2)
+        path = ""
+        if src.startswith("/media/"):
+            path = src.lstrip("/").split("?", 1)[0].split("#", 1)[0]
+        else:
+            remote = DOCS_DOWNLOAD_IMAGE_RE.fullmatch(src)
+            if remote:
+                path = "media/" + remote.group("path").lstrip("/")
+        if (keep_images and path and
+                (available_files is None or path in available_files)):
+            stats["image_paths"].append(path)
+            local = local_asset_name(path)
+            return tag[:src_match.start(2)] + local + tag[src_match.end(2):]
+        alt_match = HTML_IMG_ALT_RE.search(tag)
+        label = html_lib.escape(alt_match.group(2) if alt_match else "illustration")
+        stats["images"] += 1
+        return f'<p class="img-missing">[图片已省略] {label}</p>'
+
+    text = HTML_IMG_RE.sub(html_image_sub, text)
     return text
 
 
@@ -439,7 +476,8 @@ def clean_markdown(text: str, keep_images: bool, stats: dict,
                    variables: dict[str, str] | None = None,
                    link_index: dict[str, str] | None = None,
                    included: set[str] | None = None,
-                   web_prefix: str = "") -> tuple[dict, str, list[str]]:
+                   web_prefix: str = "",
+                   available_files: set[str] | None = None) -> tuple[dict, str, list[str]]:
     meta, body = split_frontmatter(text)
     code_blocks: list[str] = []
     body = convert_fences(body, stats, code_blocks)
@@ -450,7 +488,8 @@ def clean_markdown(text: str, keep_images: bool, stats: dict,
         body = apply_template_vars(body, variables, stats)
     body = normalize_blocks(body)
     body = strip_videos(body, stats)
-    body = rewrite_links(body, keep_images, stats, link_index, included, web_prefix)
+    body = rewrite_links(body, keep_images, stats, link_index, included, web_prefix,
+                         available_files)
     return meta, body, code_blocks
 
 
@@ -1209,7 +1248,8 @@ def main() -> int:
         if idx % 200 == 0:
             print(f"      {idx}/{len(doc_paths)}")
         meta, body, code_blocks = clean_markdown(raw, args.images, stats, variables,
-                                                 link_index, included, web_prefix)
+                                                 link_index, included, web_prefix,
+                                                 file_set)
         html_body = finalize_html(render_callouts(md_to_html(body, code_blocks)))
         title = meta.get("title") or os.path.basename(path)[:-3].replace("-", " ").title()
         summary = meta.get("summary", "")

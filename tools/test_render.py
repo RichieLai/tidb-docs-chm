@@ -202,6 +202,46 @@ def cases() -> bool:
                 ("图片链接已映射", asset in image_md),
                 ("资源名只含 ASCII", asset.isascii()))
 
+    # 15.1. 文档正文可能用 ``/*T![`` 描述 TiDB 注释语法。图片正则不能
+    # 从这个未闭合的字面量跨行吞到后续普通链接，否则会生成不存在的 m*.html。
+    stats = {**EMPTY_STATS, "image_paths": [], "vars_unknown": {}}
+    source = "语法为 `/*T![feature]`。\n\n详见 [Optimizer Hints](/optimizer-hints.md)。"
+    _meta, linked, _blocks = B.clean_markdown(
+        source, True, stats, included={"optimizer-hints.md"}
+    )
+    expected = B.html_name_for_doc("optimizer-hints.md")
+    ok &= check("图片语法不跨行吞普通链接", source,
+                ("普通文档链接仍映射为主题页", f"]({expected})" in linked),
+                ("没有伪造 HTML 图片资源", "m" + expected[1:] not in linked),
+                ("没有登记伪图片", not stats["image_paths"]))
+
+    # 15.2. 新文档有时直接使用 docs-download.pingcap.com 的 HTML 图片。
+    # 本地存在就打包，不存在就显示离线占位，最终页面不能继续引用网络资源。
+    remote = ("https://docs-download.pingcap.com/media/images/docs-cn/"
+              "tiproxy/tiproxy-traffic-replay.png")
+    source = f'<img src="{remote}" alt="TiProxy 流量回放" width="800" />'
+    stats = {**EMPTY_STATS, "image_paths": [], "vars_unknown": {}}
+    _meta, localized, _blocks = B.clean_markdown(
+        source, True, stats,
+        available_files={"media/tiproxy/tiproxy-traffic-replay.png"}
+    )
+    asset = B.local_asset_name("media/tiproxy/tiproxy-traffic-replay.png")
+    ok &= check("HTML 远程图片本地化", source,
+                ("改成本地短资源名", f'src="{asset}"' in localized),
+                ("登记本地图片", stats["image_paths"] == [
+                    "media/tiproxy/tiproxy-traffic-replay.png"]),
+                ("不再依赖网络", "https://" not in localized))
+
+    missing_source = source.replace("tiproxy-traffic-replay.png", "missing-v2.png")
+    stats = {**EMPTY_STATS, "image_paths": [], "vars_unknown": {}}
+    _meta, omitted, _blocks = B.clean_markdown(
+        missing_source, True, stats, available_files=set()
+    )
+    ok &= check("缺失的 HTML 远程图片离线降级", missing_source,
+                ("显示图片省略说明", "[图片已省略] TiProxy 流量回放" in omitted),
+                ("不再依赖网络", "https://" not in omitted),
+                ("没有登记不存在的资源", not stats["image_paths"]))
+
     # 16. 标题锚点必须与官网一致并保留中文，否则 CHM 内章节链接会失效。
     md = "## Point_Get 和 Batch_Point_Get\n\n## 第 2 步：创建 Access Key Pair\n"
     html = render(md)
