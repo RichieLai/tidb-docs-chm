@@ -74,28 +74,6 @@ dist/tidb-docs-7.5/tidb-docs-7.5.chm
 dist/tidb-docs-7.5-images/tidb-docs-7.5-images.chm
 ```
 
-### Windows 下载后无法打开
-
-Windows 会给浏览器、聊天软件或邮件下载的文件添加“网络来源”标记。HTML Help
-可能因此直接提示 `无法打开文件: mk:@MSITStore:...`，即使 CHM 内容本身完整。
-
-遇到该提示时，可以右键 CHM，选择“属性”，勾选“解除锁定”后确定；也可以在
-PowerShell 中手动移除该 CHM 的 `Zone.Identifier`：
-
-```powershell
-Unblock-File -LiteralPath "C:\tidb-docs-7.5.chm"
-```
-
-微软说明：[下载的 CHM 无法正常显示](https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/dot-chm-file-not-render-properly)
-和 [Unblock-File](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/unblock-file)。
-
-默认只保留 CHM。需要检查中间 HTML 或保留 Windows 工程时：
-
-```bash
-./build.sh release-7.5 --keep-html
-./build.sh release-7.5 --keep-hhp
-```
-
 ## 图片压缩
 
 含图片版默认使用 `compact`：图片最大宽度 1200 像素、PNG 量化为 256 色、JPEG
