@@ -41,6 +41,30 @@ CALLOUT_KINDS = ("Note", "Tip", "Warning", "Caution", "Important", "Note ")
 # 打开即正常显示中文，不必手动切换"文本编码"。
 UTF8_BOM = b"\xef\xbb\xbf"
 
+WINDOWS_LAUNCHER = r"""@echo off
+setlocal
+set "CHM_FILE=%~dp0{chm_name}"
+if not exist "%CHM_FILE%" (
+  echo CHM file not found: "%CHM_FILE%"
+  pause
+  exit /b 1
+)
+where powershell.exe >nul 2>&1
+if errorlevel 1 (
+  echo PowerShell is required to unblock the downloaded CHM file.
+  pause
+  exit /b 1
+)
+powershell.exe -NoLogo -NoProfile -NonInteractive -Command "Unblock-File -LiteralPath $env:CHM_FILE"
+if errorlevel 1 (
+  echo Unable to unblock the CHM file. Right-click it, open Properties, and select Unblock.
+  pause
+  exit /b 1
+)
+start "" "%CHM_FILE%"
+endlocal
+"""
+
 
 # --------------------------------------------------------------------------
 # 目录树
@@ -1257,6 +1281,10 @@ def main() -> int:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "wb") as fh:
             fh.write(data)
+    launcher_name = "open-chm.cmd"
+    with open(os.path.join(out, launcher_name), "wb") as fh:
+        launcher = WINDOWS_LAUNCHER.format(chm_name=args.chm)
+        fh.write(launcher.replace("\n", "\r\n").encode("ascii"))
 
     print("[5/6] 打包 CHM")
     chm_path = os.path.join(out, args.chm)
@@ -1354,11 +1382,12 @@ def main() -> int:
               f"无 *.hhk 索引与额外汇总条目")
 
     if args.prune != "none" and hygiene_ok:
-        keep = {args.chm}
+        keep = {args.chm, launcher_name}
         if args.prune == "hhp":
             keep |= {"docs.hhp", "toc.hhc"}
         removed, freed = prune_out_dir(
-            out, [*file_list, "docs.hhp", *([chmcmd_hhp] if chmcmd_hhp else [])], keep)
+            out, [*file_list, "docs.hhp", launcher_name,
+                  *([chmcmd_hhp] if chmcmd_hhp else [])], keep)
         print(f"      清理中间产物 {removed} 个（-{freed / 1048576:.1f} MB），"
               f"只保留：{'、'.join(sorted(keep))}")
 
@@ -1368,6 +1397,7 @@ def main() -> int:
     print("构建完成")
     print(f"  HTML 总计 : {total_html / 1024:.1f} KB（{len(pages)} 个文件，已打进 CHM）")
     print(f"  CHM 大小  : {chm_size / 1024:.1f} KB  -> {chm_path}")
+    print(f"  Windows   : {os.path.join(out, launcher_name)}（首次打开或下载后使用）")
     if args.prune != "chm":
         print(f"  HHP 工程  : {os.path.join(out, 'docs.hhp')}（Windows: hhc.exe docs.hhp）")
     return 0 if hygiene_ok else 1

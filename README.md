@@ -86,8 +86,28 @@ cd tidb-docs-chm
 
 ```text
 dist/tidb-docs-7.5/tidb-docs-7.5.chm
+dist/tidb-docs-7.5/open-chm.cmd
 dist/tidb-docs-7.5-images/tidb-docs-7.5-images.chm
+dist/tidb-docs-7.5-images/open-chm.cmd
 ```
+
+### Windows 首次打开
+
+Windows 会给浏览器、聊天软件或邮件下载的文件添加“网络来源”标记。HTML Help
+可能因此直接提示 `无法打开文件: mk:@MSITStore:...`，即使 CHM 内容本身完整。
+
+首次打开或重新下载后，双击与 CHM 同目录的 `open-chm.cmd`。它只执行两步：调用
+PowerShell 的 `Unblock-File` 移除该 CHM 的 `Zone.Identifier`，然后打开 CHM；以后
+可以直接双击 CHM。也可以右键 CHM，选择“属性”，勾选“解除锁定”后确定。
+
+手动命令：
+
+```powershell
+Unblock-File -LiteralPath "C:\tidb-docs-7.5.chm"
+```
+
+微软说明：[下载的 CHM 无法正常显示](https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/dot-chm-file-not-render-properly)
+和 [Unblock-File](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/unblock-file)。
 
 默认只保留 CHM。需要检查中间 HTML 或保留 Windows 工程时：
 
@@ -160,6 +180,7 @@ python3 tools/verify_chm.py dist/tidb-docs-7.5/tidb-docs-7.5.chm
 
 - `toc.hhc` 目录是否存在，目录链接是否完整；
 - 是否混入关键词索引或全文搜索数据库；
+- `/#SYSTEM` 是否明确把启动页和目录声明为 `index.html`、`toc.hhc`；
 - 所有 HTML 是否带 UTF-8 BOM；
 - 所有主题页是否使用短 ASCII 哈希文件名；
 - 是否残留 copyable 模板标记、页首导航或远程显示资源；

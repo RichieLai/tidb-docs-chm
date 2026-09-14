@@ -223,6 +223,13 @@ def cases() -> bool:
     ok &= check("重复锚点清理", "正文",
                 ("只保留一个 fragment",
                  linked.endswith(B.html_name_for_doc("ru.md") + "#什么是-request-unit-ru)")))
+
+    # 20. 下载后的 Windows 首次打开脚本只解除目标 CHM 的网络来源锁定。
+    launcher = B.WINDOWS_LAUNCHER.format(chm_name="tidb-docs-7.5.chm")
+    ok &= check("Windows 首次打开脚本", "正文",
+                ("目标文件名固定", 'tidb-docs-7.5.chm' in launcher),
+                ("调用系统解除锁定命令", "Unblock-File -LiteralPath $env:CHM_FILE" in launcher),
+                ("解除后打开 CHM", 'start "" "%CHM_FILE%"' in launcher))
     return ok
 
 

@@ -14,6 +14,7 @@ verify_chm.py —— 检查 CHM 的直接打开、离线资源、目录与版式
   5. 主题与图片是否使用短 ASCII 哈希文件名
   6. 是否残留网页模板、页首导航、远程显示资源或本地断链
   7. 有序列表是否明确写入层级类型
+  8. ``/#SYSTEM`` 是否明确声明 ``index.html`` 和 ``toc.hhc``
 
 用法：
     python3 tools/verify_chm.py dist/tidb-docs-cn/tidb-docs-cn.chm
@@ -27,6 +28,7 @@ import os
 import posixpath
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -83,6 +85,28 @@ def tree_stats(hhc_text: str) -> tuple[int, int, int]:
     return top, total, max_depth
 
 
+def system_records(data: bytes) -> dict[int, list[bytes]]:
+    """Parse the record stream in /#SYSTEM (4-byte version + TLV records)."""
+    records: dict[int, list[bytes]] = {}
+    offset = 4
+    while offset + 4 <= len(data):
+        code, size = struct.unpack_from("<HH", data, offset)
+        start = offset + 4
+        end = start + size
+        if end > len(data):
+            break
+        records.setdefault(code, []).append(data[start:end])
+        offset = end
+    return records
+
+
+def system_text(records: dict[int, list[bytes]], code: int) -> str:
+    values = records.get(code, [])
+    if not values:
+        return ""
+    return values[0].rstrip(b"\0").decode("gbk", "replace").replace("\\", "/")
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__.strip().splitlines()[-2].strip(), file=sys.stderr)
@@ -122,6 +146,20 @@ def main() -> int:
     print(f"全文数据库: {', '.join(fulltext_files) if fulltext_files else '无'}")
 
     ok = True
+    try:
+        system = reader.read("/#SYSTEM")
+    except KeyError:
+        system = b""
+    records = system_records(system) if len(system) >= 4 else {}
+    default_topic = system_text(records, 2)
+    contents_file = system_text(records, 0)
+    startup_ok = (default_topic == "index.html" and "/index.html" in reader.files
+                  and contents_file == "toc.hhc" and "/toc.hhc" in reader.files)
+    print(f"启动记录  : 默认页 {default_topic or '缺失'}，目录 {contents_file or '缺失'}")
+    if not startup_ok:
+        ok = False
+        print("  [失败] /#SYSTEM 必须明确声明 index.html 和 toc.hhc，"
+              "否则 Windows 会报 mk:@MSITStore 无法打开")
     if index_files:
         ok = False
         print("  [失败] 索引文件会被阅读器平铺追加到目录树末尾，必须从 CHM 中移除")
